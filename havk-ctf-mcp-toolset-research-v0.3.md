@@ -1,1521 +1,1450 @@
-# Havk CTF MCP — Forensics & Steganography Toolset / Semantic API
 
-**Research draft v0.3 — 2026-10-04**  
-Status: architecture/toolset research for PRD, not yet implementation contract.
+# Havk CTF MCP — Forensics, Steganography & Network Forensics
 
-This document expands `havk-ctf-mcp-toolset.md` v0.2 after reviewing the supplied MCP implementations, the MCP 2026-07-28 protocol and the official Rust SDK (`rmcp`), current upstream projects, recent CTF write-ups, and forensic/steg research/tooling.
+**Focused research draft v0.4 — 2026-10-04**  
+**Scope:** digital forensics, steganography, PCAP/network forensics, and file/document/disk/memory artifacts that directly support those categories.  
+**Out of scope for this document:** general pentesting, recon, web exploitation, reverse engineering, pwn, cloud security, generic OSINT, and general-purpose password cracking.
 
----
-
-## 1. Executive decision
-
-The previous 21-tool semantic surface is too coarse for an agent that must investigate evidence iteratively. `pcap_analyze`, `stego_detect`, `image_analyze`, and `document_analyze` each hide too many distinct workflows behind a single schema. The better reference among the supplied MCP projects is **Wireshark-MCP**, not the forensics module in `ctf-buster`: it exposes narrow, composable operations (packet listing, details, bytes, fields, search, stream following, object export, statistics, protocol analysis, anomaly analysis) and bounds output/pagination rather than returning a giant one-shot report.
-
-The recommended design is therefore:
-
-```text
-Havk MCP server (Rust / rmcp)
-        │
-        ├── typed semantic tools
-        │     ├── small structured result
-        │     ├── warnings / confidence / provenance
-        │     └── ArtifactRef / ResourceLink for large output
-        │
-        ├── artifact registry (durable, connection-independent)
-        │
-        ├── task/job registry (durable, connection-independent)
-        │
-        └── isolated workers
-              ├── native Rust primitives
-              ├── Rust crates
-              └── pinned upstream CLI backends
-```
-
-The backend policy remains **two orthogonal dimensions**:
-
-- **Image profile:** `core` vs `full` — controls footprint/domain coverage.
-- **Trust tier:** `main` vs `experimental` — controls production confidence.
-
-A third, optional dimension should be added for **MCP tool exposure**:
-
-- `--tool-profile ctf` (default)
-- `--tool-profile stego`
-- `--tool-profile network`
-- `--tool-profile disk`
-- `--tool-profile windows`
-- `--tool-profile memory`
-- `--tool-profile all`
-
-This is not dynamic discovery based on evidence. The tool set is selected when the server instance starts and remains deterministic for that instance. MCP can notify list changes, but Havk should avoid evidence-dependent tool mutation because stable lists are easier to cache, reason about, test, and budget for prompt size.
+This document replaces the broader v0.2/v0.3 direction with a deliberately narrower forensic scope. The goal is not to make Havk another Kali-style catalog of executable names. The goal is a **typed semantic MCP layer** that an agent can use iteratively while the Docker image hides a larger, replaceable backend toolchain.
 
 ---
 
-## 2. What the supplied MCP source code teaches us
+## 0. Executive decisions
 
-### 2.1 `ctf-buster`: useful workflow idea, too coarse for Havk
-
-The supplied `ctf-buster` exposes only five forensic tools:
-
-- `forensics_file_triage`
-- `forensics_stego_analyze`
-- `forensics_extract_embedded`
-- `forensics_entropy_analysis`
-- `forensics_image_analysis`
-
-Its implementation runs external commands such as `file`, ExifTool, Binwalk, `strings`, zsteg, steghide, and Foremost, then returns one large JSON/text response. It also has image paths that normalize images through Pillow/RGB for some analyses. That is convenient for a human helper, but it is not ideal as Havk's contract because:
-
-1. evidence transformations can erase raw representation details important to steg (palette indices, sub-8-bit samples, 16-bit samples, local GIF palettes);
-2. one-shot output grows quickly and is harder for an agent to page/search;
-3. extracted files are not modeled as durable artifacts with provenance;
-4. long operations are not naturally represented as durable MCP tasks;
-5. a backend's CLI vocabulary leaks too directly into the semantic layer.
-
-`ctf-buster` is still a useful baseline for what a first-pass CTF workflow expects, but not a suitable API shape to copy.
-
-### 2.2 `Wireshark-MCP`: the stronger architectural reference
-
-The supplied Wireshark-MCP is much closer to the target architecture. Important patterns to retain:
-
-- semantic tools are narrower than a single `pcap_analyze` mega-tool;
-- subprocesses are invoked with argument arrays rather than shell command strings;
-- paths and arguments are validated;
-- output is bounded and pageable;
-- timeout/cancellation kills and reaps children;
-- stderr is drained concurrently;
-- large tabular output is accumulated with row/byte ceilings;
-- results are normalized into an envelope instead of returning raw CLI text;
-- cache keys include evidence identity/mtime/arguments;
-- sensitive key material can be redacted;
-- a protocol tool can accept a semantic `protocol` enum instead of making the model guess tshark fields.
-
-For Havk this generalizes to:
-
-```text
-MCP tool
-  ↓
-semantic request
-  ↓
-policy + resource budget
-  ↓
-worker backend adapter
-  ↓
-normalized observation(s)
-  ↓
-artifact registry
-```
-
-not:
-
-```text
-MCP → arbitrary shell → stdout
-```
-
-### 2.3 `CTF-MCP`: another warning about over-normalization
-
-The supplied `CTF-MCP` forensics implementation contains convenient helpers for magic signatures, EXIF-like inspection, appended-data checks and LSB extraction, but it also illustrates why Havk should own raw-format parsers for steg-critical formats. Generic image decoding is useful for visual transforms, but not as the source of truth for palette/index/sample-level steganalysis.
-
-### 2.4 `ctfd-mcp-server`
-
-This project is mostly a CTFd service API MCP and is not a forensic backend reference. Its value is primarily organizational (server configuration/state/API handling), not evidence parsing.
+1. **Do not collapse network forensics into `tshark`.** Treat Wireshark CLI as a suite: `tshark`, `capinfos`, `captype`, `editcap`, `mergecap`, `reordercap`, `text2pcap`, `dumpcap`, and optionally `sharkd`. Each has a distinct forensic role.
+2. **Do not expose backend executables as MCP tools.** `pcap_merge` is a semantic tool; `mergecap` is an implementation detail. `pdf_objects` is semantic; `mutool show` or `qpdf --json` are backend choices.
+3. **`mutool` is technically excellent but should not be the only default PDF backend.** MuPDF's CLI covers low-level object inspection, repair, rendering/text extraction, resource extraction, audit and scripting, but MuPDF is AGPL/commercial. Default Havk should retain an independent, machine-structured PDF path such as qpdf + pdfcpu + security-specific scanners. `mutool` is recommended as a supported optional/copyleft backend unless Havk intentionally adopts an AGPL-compatible distribution model.
+4. **HexStrike-AI is useful as a breadth/orchestration reference, not as an executor design reference.** Its source demonstrates how much security tooling an MCP can expose, but its generic `additional_args` style and shell-based execution path are exactly what Havk should avoid.
+5. **Docker is the supported runtime contract.** Evidence is mounted read-only; artifacts are written to a separate volume. Live packet capture is disabled by default and only enabled with an explicit server flag plus narrowly scoped container capabilities.
+6. **Keep the two existing dimensions:**
+   - image profile: `core` / `full`;
+   - backend trust tier: `main` / `experimental`.
+7. **Add static MCP tool profiles:** `forensics`, `stego`, `network`, `all`. The server chooses the list at startup. Do not add/remove tools because a particular artifact was discovered.
+8. **Use MCP Tasks for long operations when negotiated, with a `job` fallback.** The server decides sync vs task based on input size/cost; the model should not need to know implementation thresholds.
+9. **All evidence is immutable.** Repair, decryption, merge, reorder, extraction, reconstruction and conversion always produce child artifacts with provenance.
+10. **Prefer upstream release artifacts and upstream source builds over distro packages.** Docker's base distribution is not the version authority for forensic tools.
 
 ---
 
-# 3. MCP 2026-07-28 / Rust `rmcp`: design consequences
+# 1. Scope and non-goals
 
-## 3.1 Version target
+## 1.1 Included
 
-Use the stable MCP **2026-07-28** protocol and current stable `rmcp` 3.x. As of this research date the latest GitHub release is `rmcp-v3.4.0` (2026-09-15). The Rust SDK README states support for the stable 2026-07-28 protocol, and its roadmap reports 100% date-versioned server/client conformance for 2025-11-25 and 2026-07-28.
+### Steganography
 
-Primary references:
+- PNG/BMP raw LSB and channel/bit-plane analysis;
+- indexed-color/palette techniques;
+- GIF/APNG/WebP frame/container techniques;
+- JPEG stego families such as steghide, OutGuess, JSteg;
+- trailing/appended data and polyglots;
+- metadata hiding;
+- text/unicode/whitespace stego;
+- audio waveform/spectrogram/DTMF/PCM-LSB/modem/SSTV;
+- QR/barcode recovery where directly relevant to stego/forensics;
+- classical statistical steganalysis, clearly marked probabilistic;
+- optional ML steganalysis.
 
-- https://github.com/modelcontextprotocol/rust-sdk
-- https://github.com/modelcontextprotocol/rust-sdk/releases
-- https://github.com/modelcontextprotocol/rust-sdk/blob/main/ROADMAP.md
-- https://github.com/modelcontextprotocol/rust-sdk/discussions/969
-- https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/blog/content/posts/2026-07-28-spec-ga/index.md
+### Digital forensics
 
-## 3.2 Use typed tools, not CLI-shaped tools
+- file identification and metadata;
+- archives and encrypted archive recovery techniques common in CTF;
+- carving and embedded object recovery;
+- PDF and Office forensics;
+- SQLite and deleted-record/WAL analysis;
+- disk images, EWF/E01, filesystem metadata, deleted files and raw recovery;
+- memory images;
+- core Windows artifacts: EVTX, Registry, MFT, Prefetch, LNK, PST where appropriate;
+- forensic timelines and bulk feature extraction in `full`.
 
-`rmcp` supports `#[tool]`, `#[tool_router]`, `#[tool_handler]`, Serde and `schemars` JSON Schema 2020-12. Therefore every public tool should have a stable typed input/output structure.
+### Network/PCAP forensics
 
-Good:
+- capture-file metadata and validation;
+- repair, merge, reorder, slicing, deduplication and format conversion;
+- text/hex dump conversion to PCAP;
+- packet listing/detail/field extraction/search;
+- stream following and object export;
+- conversations/endpoints/protocol statistics;
+- CTF-specific USB HID, DNS exfiltration, ICMP covert data and payload reconstruction;
+- Zeek session/event logs in `full`;
+- optional live capture using `dumpcap`, off by default.
+
+## 1.2 Explicitly out of scope
+
+This document does **not** design tools for:
+
+- Nmap/masscan/recon;
+- web scanning/exploitation;
+- CVE exploitation;
+- generic red-team automation;
+- reverse engineering/malware decompilation;
+- binary exploitation;
+- cloud/Kubernetes security;
+- social OSINT;
+- arbitrary shell execution;
+- unrestricted John/hashcat orchestration.
+
+HexStrike includes these domains, but Havk should not import its scope wholesale.
+
+---
+
+# 2. MCP reference projects reviewed
+
+Every MCP reference discussed in this research is listed here with its repository URL.
+
+| Project | Repository | What Havk should learn | What Havk should not copy |
+|---|---|---|---|
+| **Wireshark-MCP** | https://github.com/bx33661/Wireshark-MCP | granular packet tools, bounded output, packet paging/context, field extraction, search, follow-stream, stats, protocol abstractions, write-root security | backend-specific proliferation without Havk profiles; any assumptions that only PCAP files matter |
+| **HexStrike-AI** | https://github.com/0x4m4/hexstrike-ai | large tool registry, health/process management, Docker/orchestration ideas, proof that MCP can coordinate many security tools | generic `additional_args`, shell command strings, huge always-on tool list, arbitrary command endpoints |
+| **ctf-buster** | https://github.com/agentfanclub/ctf-buster | simple CTF workflow baseline; triage → steg → extraction → entropy → image analysis | only five coarse forensic tools; large one-shot responses; image normalization as evidence source |
+| **CTF-MCP** | https://github.com/Coff0xc/CTF-MCP | native/simple forensic helpers and CTF-oriented ergonomics | treating normalized image representations as authoritative raw steg evidence |
+| **ctfd-mcp-server** | https://github.com/MrJamescot/ctfd-mcp-server | MCP service organization/configuration examples | not a forensic backend reference; mainly CTFd platform API |
+| **steganography-mcp** | https://github.com/badchars/steganography-mcp | broad steg technique catalog: LSB, RS, SPA, JPEG families, BPCS, GIF/video, network covert channels, MP3, text | 128 always-visible tools; young project; algorithms must be independently corpus-tested |
+| **Mulder** | https://github.com/calebevans/mulder | typed forensic interfaces, no-shell philosophy, audit/provenance, broad DFIR backend mapping | enterprise incident-report workflow is broader/heavier than Havk CTF MCP |
+| **SIFT-MCP / Valhuntir** | https://github.com/AppliedIR/sift-mcp | separate forensic endpoints/profiles, evidence-oriented tool boundaries, audit/human review | entire case/RAG/OpenCTI platform is outside current scope |
+| **volatility-mcp** | https://github.com/Gaffx/volatility-mcp | semantic wrapping of Volatility plugins | thin REST/MCP wrapping is not enough for Havk resource limits/provenance |
+
+## 2.1 HexStrike-AI source audit
+
+The supplied HexStrike snapshot is valuable because it exposes a much larger security-tool surface than the earlier CTF MCP examples. Its CTF/forensic inventory names Volatility 3, Foremost, PhotoRec, TestDisk, Sleuth Kit, StegSolve, zsteg, OutGuess, Scalpel, bulk_extractor, ExifTool and Binwalk.
+
+However, its source reinforces Havk's need for a stricter design:
+
+- MCP wrappers repeatedly accept free-form `additional_args` strings;
+- forensic wrappers are backend-shaped (`volatility3_analyze`, `foremost_carving`, `steghide_analysis`, `exiftool_extract`) rather than stable semantic contracts;
+- the server contains shared command-execution paths using `subprocess.Popen(..., shell=True)`;
+- upstream has open 2026 issues/PRs specifically discussing command-injection risks around `additional_args`, target fields, and generic command execution;
+- upstream also has a real usability issue caused by exposing more than 128 MCP tools at once.
+
+**Havk conclusion:** use HexStrike as a **coverage checklist and orchestration warning**, not as an executor template.
+
+Relevant upstream links:
+
+- Repository: https://github.com/0x4m4/hexstrike-ai
+- Issue: command injection via `additional_args`: https://github.com/0x4m4/hexstrike-ai/issues/265
+- PR attempting to fix it: https://github.com/0x4m4/hexstrike-ai/pull/266
+- Issue on excessive MCP tool count: https://github.com/0x4m4/hexstrike-ai/issues/119
+- Security/RCE discussions: https://github.com/0x4m4/hexstrike-ai/issues/204
+- Ecosystem article: https://cybersecuritynews.com/hackers-leverage-hexstrike-ai-tool/
+
+The article is useful only as evidence of adoption/interest; technical design decisions should come from source and primary documentation.
+
+---
+
+# 3. MCP 2026-07-28 and Rust `rmcp`: architecture rules
+
+Primary sources:
+
+- Official Rust SDK: https://github.com/modelcontextprotocol/rust-sdk
+- MCP specification repository: https://github.com/modelcontextprotocol/modelcontextprotocol
+- MCP specification site: https://modelcontextprotocol.io/
+- rmcp 3.x migration discussion: https://github.com/modelcontextprotocol/rust-sdk/discussions/969
+- rmcp roadmap/conformance: https://github.com/modelcontextprotocol/rust-sdk/blob/main/ROADMAP.md
+
+## 3.1 Protocol target
+
+Target **MCP 2026-07-28** and a stable `rmcp` 3.x release pinned in Cargo.lock. At research time, `rmcp-v3.4.0` was the latest indexed stable release (2026-09-15). The SDK documents compatibility with the stable 2026-07-28 protocol and 100% conformance for the date-versioned server/client conformance suite.
+
+## 3.2 Typed tools
+
+Use Rust structs + Serde + `schemars`, with `#[tool]`, `#[tool_router]`, and `#[tool_handler]`.
+
+Good public contract:
 
 ```rust
-struct PcapFollowParams {
-    artifact_id: ArtifactId,
-    transport: Transport,
-    stream_id: u32,
-    representation: StreamRepresentation,
-    max_bytes: Option<u64>,
+#[derive(Deserialize, JsonSchema)]
+struct PcapMergeParams {
+    artifacts: Vec<ArtifactId>,
+    order: MergeOrder,
+    output_format: CaptureFormat,
+    idb_mode: Option<IdbMergeMode>,
 }
 ```
 
-Bad:
+Bad public contract:
 
 ```rust
-struct RunTsharkParams {
-    args: Vec<String>,
+struct RunTool {
+    command: String,
+    args: String,
 }
 ```
 
-The model should choose forensic intent. The adapter chooses exact CLI flags.
+Backends may use exact CLI flags internally, but the model selects forensic intent.
 
-## 3.3 `structuredContent` should be small; artifacts should carry large results
+## 3.3 Statelessness and durable handles
 
-MCP 2026-07-28 permits flexible output schemas and structured content. Havk should return:
+MCP 2026-07-28 is stateless at the protocol level. Related operations must therefore carry explicit handles:
 
-- concise observations;
-- typed statistics;
-- warnings/confidence;
-- child artifact references;
-- optional `ResourceLink` entries.
+```text
+artifact_id
+job_id / task_id
+workspace_id (transport/auth context, not inferred from prior call)
+```
 
-Large binary data, extracted files, reconstructed streams, generated bit planes, rendered pages, memory dumps, SQLite exports, and timelines should **not** be inlined into normal tool text.
+Do not assume the same HTTP connection or even the same handler instance will process successive calls.
 
-Recommended result shape:
+## 3.4 Results: structured observations + ArtifactRefs
+
+Normal tool responses should be small:
 
 ```json
 {
   "status": "ok",
-  "backend": {
-    "name": "tshark",
-    "version": "..."
-  },
   "observations": [
     {
-      "kind": "dns_exfil_candidate",
-      "confidence": 0.87,
-      "summary": "High-entropy labels across 183 DNS queries"
+      "kind": "out_of_order_timestamps",
+      "severity": "info",
+      "count": 134
     }
   ],
   "artifacts": [
     {
       "id": "art_01K...",
       "uri": "havk://artifact/art_01K...",
-      "mime_type": "application/octet-stream",
-      "size": 14822,
-      "sha256": "..."
+      "mime_type": "application/vnd.tcpdump.pcapng",
+      "sha256": "...",
+      "size": 1842812
     }
   ],
   "truncated": false
 }
 ```
 
-## 3.4 Stateless HTTP changes how state must be stored
+Use MCP `structuredContent` for normalized data and MCP Resources/ResourceLinks for large or binary outputs.
 
-MCP 2026-07-28's Streamable HTTP model is stateless at the protocol core. Therefore:
+Never inline:
 
-- do not bind evidence state to a connection/session object;
-- `artifact_id` must resolve through a workspace-level registry;
-- `job_id`/task state must survive request boundaries;
-- worker results should commit atomically into the artifact store;
-- authorization/workspace identity is separate from transport connection identity.
+- entire recovered files;
+- huge packet tables;
+- rendered PDF pages;
+- all bit planes;
+- thousands of carved objects;
+- memory dumps;
+- full Zeek logs;
+- full Volatility JSON.
 
-This also makes stdio and Streamable HTTP share the same domain model.
+## 3.5 Tasks
 
-## 3.5 Long-running work: MCP Tasks first, job fallback second
+Operations expected to run long should become MCP Tasks when the client negotiates the Tasks extension. Otherwise Havk returns an internal `job_id` through a static `job` tool.
 
-The official Tasks extension allows a server to turn a `tools/call` into an asynchronous task and exposes `tasks/get`, `tasks/update`, and `tasks/cancel`. Task creation is server-directed when the client declares support.
-
-Use it for operations such as:
+Typical task candidates:
 
 - deep carving;
-- password/key search;
-- PhotoRec recovery;
-- Plaso timeline creation;
+- Binwalk/unblob recursion;
+- archive attacks;
+- OCR on many pages;
+- PCAP object export on large captures;
+- Zeek processing;
+- PhotoRec;
+- Plaso;
 - Volatility scans/dumps;
-- bulk_extractor;
-- Zeek processing of large PCAPs;
-- mobile full-report generation.
+- bulk_extractor.
 
-Because not all MCP clients support Tasks yet, keep a **fallback** `job` semantic tool, but do not make callers choose Task vs sync manually. The server decides from cost estimates and negotiated capabilities.
+## 3.6 Static tool profiles
 
-## 3.6 Tool annotations
+2026-07-28 supports list-change notification and caching, but Havk should still expose a deterministic tool list for the lifetime of a server instance.
 
-Set MCP annotations consistently:
+Recommended startup profiles:
 
-- read-only evidence inspection: `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`;
-- repair/extraction still never mutates source evidence; it creates child artifacts, so it is non-destructive with respect to evidence;
-- network access is normally disabled, so `openWorldHint=false` for forensic tools;
-- annotations are hints, not security controls.
+```text
+--tool-profile forensics
+--tool-profile stego
+--tool-profile network
+--tool-profile all
+```
 
-## 3.7 Logging and stdio
+Do **not** enable `memory_*` because a `.raw` file appeared. Start a server profile that includes those tools.
 
-For stdio transport, stdout must remain MCP protocol output. Worker/tool diagnostics go to stderr or structured internal logs.
+## 3.7 Stdio rules
+
+For stdio transport:
+
+- stdout belongs to MCP protocol messages;
+- logs go to stderr;
+- external subprocess stdout/stderr must be captured by workers, never inherited blindly;
+- a backend producing unbounded text must be truncated/paged before reaching MCP.
 
 ---
 
-# 4. Execution/security model
+# 4. Docker-first execution model
 
-## 4.1 Same binary, isolated worker mode
+## 4.1 Images
 
-Recommended layout:
-
-```text
-havk-mcp serve --transport stdio --profile core --tool-profile ctf
-havk-mcp serve --transport http  --profile full --tool-profile all
-havk-mcp worker --backend qpdf ...
-havk-mcp worker --backend native-png ...
-```
-
-The server is an orchestrator. Untrusted parsers should run in a child worker even if they are Rust crates.
-
-Reasons:
-
-- parser panic must not kill MCP;
-- malformed files can trigger OOM;
-- zip/decompression bombs must be bounded;
-- some crates read full input into memory;
-- C/C++ tools must be isolated;
-- cancellation becomes process-group termination rather than cooperative hope.
-
-## 4.2 Worker budget
-
-Each invocation receives policy such as:
+Recommended images:
 
 ```text
-wall timeout
-CPU seconds
-address-space / RSS limit
-max output bytes
-max child artifacts
-max total extracted bytes
-max recursion depth
-max decompressed ratio
-max file count
-network disabled by default
-read-only evidence mount
-writable scratch/output directory only
+ghcr.io/<org>/havk-mcp:core
+ghcr.io/<org>/havk-mcp:full
+ghcr.io/<org>/havk-mcp:stego-ml   # optional later
 ```
 
-Recommended cost classes:
+`core` contains high-frequency CTF forensics/stego/network tools. `full` adds memory, heavier disk/timeline recovery, Windows artifact enrichment and Zeek/unblob-class backends.
 
-| Class | Typical operations | Default execution |
-|---|---|---|
-| A | hashes, magic, strings preview, metadata summary | sync, 2–5 s |
-| B | OCR, barcode, PDF inspection, PCAP query | sync if small, 10–30 s |
-| C | extraction, Binwalk, stream export | task/job above threshold |
-| D | recovery, crack, timeline, memory, mobile report | task/job |
+## 4.2 Filesystem model
 
-## 4.3 Immutable evidence/artifacts
-
-No public forensic operation modifies its source.
+Suggested container layout:
 
 ```text
-art_A (broken.png)
-   │
-   └── file_repair
-          ↓
-       art_B (repaired.png)
-       parent = art_A
-       repair_log = [...]
+/evidence   read-only input mount
+/artifacts  writable immutable artifact store
+/scratch    ephemeral worker scratch
+/config     tools.lock.toml + rules + optional profiles
 ```
 
-Every artifact records at least:
+External API should prefer `artifact_id`, not host paths.
 
-- id;
-- parent(s);
-- SHA-256;
-- byte size;
-- MIME / identified type;
-- origin tool + operation + backend version;
-- source offsets where relevant;
-- creation timestamp;
-- workspace-relative storage path (internal only).
+If an initial user file is mounted under `/evidence`, the ingestion operation registers it and returns an `artifact_id`.
+
+## 4.3 Worker isolation
+
+Even Rust parsers should normally execute in `havk worker` when processing attacker-controlled evidence.
+
+Per-worker budgets:
+
+- wall timeout;
+- CPU limit;
+- RSS/address-space limit;
+- maximum stdout/stderr bytes;
+- maximum artifact count;
+- maximum single artifact size;
+- maximum aggregate extracted size;
+- maximum decompression ratio;
+- maximum recursion depth;
+- no network by default;
+- no shell;
+- no inherited credentials;
+- evidence path read-only.
+
+## 4.4 Live capture is a separate privilege mode
+
+`dumpcap` belongs in the Wireshark toolchain, but offline forensics should not grant packet-capture privileges by default.
+
+Normal container:
+
+```text
+no NET_RAW
+no NET_ADMIN
+no host networking requirement
+pcap_capture tool hidden/disabled
+```
+
+Explicit live mode can be run with narrowly scoped capabilities, for example conceptually:
+
+```text
+--cap-add=NET_RAW
+--cap-add=NET_ADMIN
+--tool-profile network
+--enable-live-capture
+```
+
+The exact network namespace/host-network configuration is a deployment decision. Havk should never require `--privileged` merely to analyze saved PCAP files.
 
 ---
 
-# 5. Evidence ranking used for backend selection
+# 5. Acquisition and version locking
 
-A backend is not promoted merely because it is Rust/Go or popular on GitHub.
+## 5.1 Policy
 
-**Strongest signals:**
+Priority order:
 
-1. real production / institutional use;
-2. mature upstream lineage and maintainers;
-3. public hostile-input/fuzz/corpus testing;
-4. active maintenance/security fixes;
-5. repeated real CTF/DFIR use;
-6. reproducible CLI / structured output / batch mode;
-7. signed/checksummed official releases;
-8. stars/forks/adoption as supporting signals.
+1. official upstream prebuilt binary + checksum/signature/attestation;
+2. official upstream release/tag/source tarball built in a Docker builder stage;
+3. language package only when that is the upstream distribution channel, pinned by hash/version;
+4. distro package only for build dependencies/bootstrap, not as the forensic-tool version authority.
 
-A rewrite with weak adoption stays `experimental`, while a rewrite with strong lineage and production use can immediately become `main` (YARA-X is the canonical example).
+Never download `/releases/latest` inside Docker build.
+
+Instead:
+
+```text
+updater resolves latest upstream
+→ verifies provenance/checksum
+→ builds candidate
+→ doctor probes
+→ golden corpus
+→ footprint measurement
+→ PR updates tools.lock.toml
+```
+
+## 5.2 Example lock
+
+```toml
+[wireshark]
+version = "4.6.9"
+source = "https://www.wireshark.org/download/src/all-versions/wireshark-4.6.9.tar.xz"
+kind = "source"
+sha256 = "<pinned-by-updater>"
+components = [
+  "tshark",
+  "capinfos",
+  "captype",
+  "editcap",
+  "mergecap",
+  "reordercap",
+  "text2pcap",
+  "dumpcap",
+  "sharkd"
+]
+
+[qpdf]
+version = "12.4.2"
+kind = "official-release-binary"
+sha256 = "<arch-specific>"
+
+[pdfcpu]
+version = "0.16.0"
+kind = "official-release-binary"
+sha256 = "<arch-specific>"
+```
 
 ---
 
-# 6. Recommended backend catalog
+# 6. Shared forensic primitives
 
-Legend:
+These operations support stego, network and disk/document forensics and therefore belong in the focused project.
 
-- **C/M** = core / main
-- **C/E** = core / experimental
-- **F/M** = full / main
-- **F/E** = full / experimental
-- **DEV** = oracle/testing only, not runtime target
-- **OPT** = optional specialized image/bundle
+## 6.1 Native Havk — Core/Main
 
-## 6.1 Native Havk Rust primitives
-
-These are small enough to own directly and should be **C/M** after corpus tests.
-
-| Component | Capability |
+| Primitive | Reason to own it |
 |---|---|
-| byte/magic engine | magic signatures, extension/MIME mismatch, truncated headers |
-| hashing | SHA-256 by default; MD5/SHA-1 only when compatibility/evidence matching needs them |
-| string scanner | ASCII, UTF-8, UTF-16LE/BE, configurable minimum, offsets |
-| entropy scanner | whole-file + block entropy with boundary candidates |
-| hex/byte window | bounded byte ranges around offsets |
-| appended-data detector | PNG IEND, JPEG EOI, GIF trailer, PDF EOF, ZIP structures etc. |
-| simple polyglot detector | competing valid signatures/structures |
-| raw carver | Aho-Corasick multi-signature scan + bounded extraction |
-| PNG raw parser | chunk sequence, CRC, IHDR, PLTE/tRNS, IDAT boundaries, IEND, trailing bytes |
-| APNG parser | acTL/fcTL/fdAT + frame extraction without flattening |
-| GIF raw parser | global/local palettes, image descriptors, frame disposal, palette index preservation |
-| JPEG marker parser | SOI/EOI, APPn, COM, DQT/DHT/SOS marker inventory, trailing bytes |
-| simple file repair | PNG CRC/IHDR/IEND, ZIP EOCD/header cases; always child artifact |
-| raw image steg | channel/sample planes, palette index analysis, bit planes, difference/xor |
-| text steg | zero-width, variation/bidi controls, homoglyph flags, whitespace encodings |
-| audio primitives | PCM statistics, FFT/spectrogram, Goertzel DTMF, basic PCM LSB |
-| CTF network decoders | USB-HID keyboard, DNS-label reconstruction, ICMP payload extraction |
+| SHA-256 + optional MD5/SHA-1 | deterministic, trivial, used everywhere |
+| ASCII/UTF-8/UTF-16 strings with byte offsets | avoids fragile CLI parsing and supports paging |
+| bounded hex/byte ranges | key primitive for forensic reasoning |
+| entropy by range/window | useful for packed/encrypted/embedded regions |
+| common magic/signature engine | deterministic first opinion |
+| extension/MIME disagreement | CTF high-value anomaly |
+| appended/trailing data | PNG/JPEG/GIF/PDF/etc. |
+| simple polyglot indicators | multiple valid structures/signatures |
+| raw signature carver | bounded, provenance-aware extraction |
+| PNG/APNG/GIF/JPEG structural parsers | preserves raw representation for steg |
+| simple repair primitives | child-artifact only |
 
-### Why add APNG/GIF raw parsers?
+## 6.2 Main external/common backends
 
-Recent CTFs demonstrate that container representation itself carries the secret. An openECSC 2025 challenge required understanding APNG structure, while SAS CTF 2025 used GIF local palettes in a way generic image libraries could obscure. This is exactly the type of evidence Havk should preserve rather than normalize to RGB early.
+| Backend | Tier | Role |
+|---|---|---|
+| **YARA-X** | core/main | rules/signature engine |
+| **Magika CLI** | core/main | probabilistic second opinion for file type |
+| **ExifTool** | core/main | broad metadata knowledge |
+| **Binwalk v3** | core/main | embedded signature scan/extract |
+| **7zz** | core/main | archives + many image/container formats |
+| **unblob** | full/main | deep recursive extraction fallback |
+| **Deark** | full/main | obscure/legacy formats, thumbnails/embedded assets |
 
-References:
-
-- https://ctf.zeba.dev/2025/openecsc/stego/calamansi/writeup/
-- https://ctftime.org/writeup/40254
-
----
-
-## 6.2 File identification and signature analysis
-
-### YARA-X — **C/M**
-
-**Use:** signature/rule matching, structural modules, Havk CTF ruleset.  
-**Why Main:** official successor line from VirusTotal/YARA maintainers; Rust implementation; production pedigree; rapid releases. YARA-X 1.21.0 was published 2026-09-29 via trusted publishing/attestation on PyPI even though GitHub's release page indexing may lag.
-
-Recommendation: integrate as worker/library rather than exposing a `run_yara` tool. Public semantic tool is `file_scan`.
-
-Upstream:
-- https://github.com/VirusTotal/yara-x
-- https://pypi.org/project/yara-x/
-
-### Magika CLI — **C/M**, second opinion only
-
-**Use:** probabilistic content classification.  
-**Why Main:** Google production lineage, broad adoption, ICSE research, official Linux x64/arm64 prebuilt assets with SHA256/attestation.  
-**Constraint:** never override deterministic magic/structural evidence silently; report confidence and disagreement.
-
-Upstream:
-- https://github.com/google/magika
-- https://github.com/google/magika/releases
-
-### Traditional `file`/libmagic
-
-Do **not** make it the authoritative architecture dependency if Havk already owns common magic parsing. It can remain a development oracle or compatibility backend. Magika + Havk structural identification provides more useful agent-facing information.
+Experimental replacements such as OxiDex should be evaluated with differential corpora rather than promoted for being Rust.
 
 ---
 
-## 6.3 Metadata
+# 7. Steganography toolset
 
-### ExifTool — **C/M**
+## 7.1 Native raw image analysis — Core/Main
 
-Still the default. Its breadth and long-tail format knowledge outweigh the Perl runtime cost.
+Havk must preserve raw storage representation before any RGB normalization.
 
-### OxiDex — **C/E**
+### PNG
 
-Promising Rust ExifTool-like rewrite, but adoption/reputation is far below ExifTool. Run differential corpus tests; do not promote based on README benchmarks.
+- chunk inventory and order;
+- IHDR fields;
+- palette (`PLTE`) and transparency (`tRNS`);
+- raw sample bit depth, including sub-8-bit and 16-bit;
+- CRC verification;
+- IDAT boundaries;
+- post-IEND bytes;
+- APNG `acTL`, `fcTL`, `fdAT`;
+- frame extraction.
 
-### Deark — **F/M specialist**
+### GIF
 
-Reconsider the earlier decision to discard Deark. It is not merely another Binwalk: it focuses on obscure/legacy file-format decoding, metadata, thumbnails, embedded assets, APNG frame extraction and conversion. It has been maintained for many years and is still active in 2026. Its own documentation warns that it is C code handling untrusted files and that resource limits are imperfect, so it must run in the worker sandbox with `-maxfiles`, `-maxfilesize`, total-size limits and restricted modules.
+- global color table;
+- local color table per frame;
+- palette indices, not merely rendered RGB;
+- frame disposal methods;
+- comments/application extensions;
+- per-frame extraction and diff.
 
-Useful niche: files that common CTF tools identify but cannot meaningfully unpack/render.
+### JPEG
 
-Upstream:
-- https://github.com/jsummers/deark
-- https://github.com/jsummers/deark/blob/master/technical.md
+- marker sequence;
+- APPn/COM;
+- DQT/DHT/SOS inventory;
+- EOI and trailing bytes;
+- metadata/appended payload candidates;
+- route to specialized JPEG stego backends.
 
----
+## 7.2 LSB / bit-plane
 
-# 7. Steganography backend set
+### `zsteg` — Core/Main transitional
 
-## 7.1 PNG/BMP LSB
+Keep as an oracle and fallback during v1. It has real CTF adoption and a mature search vocabulary for PNG/BMP.
 
-### zsteg — **C/M transitional oracle**
+Do not treat all `zsteg -a` detections as facts. Normalize and score results.
 
-Keep it initially because it is repeatedly used in current CTFs and its search space is a useful compatibility target. But Havk should not treat every `zsteg -a` line as evidence: 2026 write-ups explicitly show hundreds of false-positive-looking hits.
+### Havk LSB engine — Core/Experimental → Core/Main
 
-Recent use:
-- CTF@CIT 2025: LSB extraction directly revealed flags.
-- Hacktheon Sejong 2025: `b1,rgb,lsb,xy` extracted another PNG.
-- 2026 write-ups document noisy `zsteg -a` false positives.
+Required dimensions:
 
-Runtime target: phase zsteg out after native parity.
+- bits/sample: 1–4 initially;
+- channel selections/permutations;
+- LSB/MSB;
+- XY/YX traversal;
+- row reversal;
+- byte/bit packing variants;
+- offset/skip;
+- raw palette-index mode;
+- extraction score: printable ratio, entropy, known magic, YARA-X hit.
 
-### Havk raw LSB engine — **C/E → C/M after parity**
+Promotion requires differential corpus parity against zsteg plus synthetic ground truth.
 
-Must preserve raw PNG samples. Do not base authoritative steg extraction on a high-level image conversion that expands palette/sub-8-bit/16-bit samples before analysis.
+## 7.3 Visual steg operations — Core/Main
 
-Minimum search dimensions:
-
-- sample bit depth: 1..4 initially;
-- channel/order: R/G/B/A permutations and palette indices;
-- bit significance: LSB/MSB;
-- traversal: XY/YX, row direction options;
-- packing: bit/byte endian variants;
-- skip/offset;
-- signature/text scoring;
-- artifact extraction when a stable header/format is detected.
-
-## 7.2 Bit planes, palette and frame stego — **native C/M**
-
-Semantic support must include:
+Native semantic capabilities replacing StegSolve-like GUI workflows:
 
 - channel isolation;
-- individual bit planes;
-- palette-index visualization;
-- global/local palette inventory;
-- GIF frame extraction;
-- APNG frame extraction;
-- frame difference/XOR;
-- alpha-only visualization;
-- histogram and palette usage statistics.
+- channel arithmetic;
+- per-bit plane generation;
+- XOR/diff between images/frames;
+- alpha visualization;
+- histogram;
+- palette usage map;
+- frame extraction;
+- frame difference;
+- coordinate-based crop/enlarge for OCR/barcode.
 
-This replaces the useful parts of StegSolve for a non-GUI agent.
+## 7.4 JPEG stego families
 
-Use `gifsicle` as a **C/M external compatibility/frame backend** where useful; native raw parsing remains the evidence source.
+| Tool | Tier | Why keep it |
+|---|---|---|
+| **StegSeek** | core/main | fast steghide-compatible extraction/cracking |
+| **steghide** | core/main compatibility | exact legacy/info/extract behavior |
+| **OutGuess** | core/main | distinct JPEG DCT family; modern 2026 CTF evidence shows it solving cases where steghide/JSteg do not |
+| **jsteg** | core/main specialist | cheap coverage of another JPEG DCT embedding family |
+| **OpenStego** | full/main | additional established data-hiding/watermark formats; Java footprint too heavy for minimal core |
 
-## 7.3 JPEG steganography family
+A 2026 SCTF challenge explicitly used an OutGuess payload after steghide and jsteg attempts failed, which is a strong reason not to postpone it.
 
-The previous draft is too weak here. JPEG DCT stego is not covered by zsteg.
+Reference write-up: https://github.com/hax1ng/SCTF-2026-writeups/blob/main/misc/SYC4113/README.md
 
-### StegSeek — **C/M**
+## 7.5 Statistical steganalysis
 
-Fast steghide-compatible extraction/cracking. Narrow, established CTF utility.
+Native experimental methods:
 
-### steghide — **C/M compatibility**
+- chi-square;
+- RS analysis;
+- Sample Pair Analysis.
 
-Keep for compatibility/info/extraction behavior that StegSeek does not necessarily mirror.
+Never return:
 
-### OutGuess — **C/M**
+```json
+{"stego": true}
+```
 
-Promote from “later” to core/main. A 2026 CTF write-up shows OutGuess recovering the payload after steghide and jsteg attempts failed. It covers a distinct JPEG DCT method and is still operationally relevant.
-
-Upstream: https://github.com/resurrecting-open-source-projects/outguess
-
-### jsteg — **C/M specialist**
-
-Small Go implementation with prebuilt-friendly characteristics and a different JPEG embedding family. It is cheap coverage and appears in current stego workflows even when not the winning tool.
-
-Upstream: https://github.com/lukechampine/jsteg
-
-### OpenStego — **F/M**
-
-Active, established project for data hiding/watermarking. Java footprint makes it inappropriate for minimal core, but it is valuable for algorithm-specific compatibility that a generic native detector will not recover.
-
-Upstream: https://github.com/syvaidya/openstego
-
-### Aletheia — **OPT: `stego-ml`**
-
-Peer-reviewed steganalysis toolbox with ML/statistical methods. Do not place its Python/model stack in normal `full`; make a separate optional image/profile. It is useful for advanced/JPEG/adaptive steganalysis rather than basic extraction.
-
-Upstream: https://github.com/daniellerch/aletheia
-
-## 7.4 Statistical steg detection
-
-Native implementations:
-
-- chi-square: **C/E**, cheap and useful heuristic;
-- RS analysis: **C/E**;
-- Sample Pair Analysis: **C/E**.
-
-RS/SPA must return probabilistic evidence, not “stego=true”. Published work and later evaluations show non-trivial false alarms. Use StegExpose/Aletheia/reference implementations and synthetic corpus as oracles, not as unquestioned truth.
-
-Recommended result:
+Return applicability and probabilistic evidence:
 
 ```json
 {
   "method": "rs",
-  "applicability": "lsb-replacement-like",
   "score": 0.71,
   "confidence": "medium",
+  "applicability": "lsb-replacement-like embedding",
   "limitations": [
-    "Not reliable for arbitrary/adaptive embedding",
-    "May false-positive on natural image statistics"
+    "probabilistic",
+    "may false-positive on natural image statistics",
+    "not a generic detector for adaptive steganography"
   ]
 }
 ```
 
-## 7.5 Text steganography — **native C/M**
+### Aletheia — Optional `stego-ml`
 
-Cover:
+Repository: https://github.com/daniellerch/aletheia
 
-- zero-width characters;
-- variation selectors;
+Use as a separate optional image/profile for advanced statistical/ML steganalysis. Do not inflate normal `core`/`full` with its ML stack.
+
+## 7.6 Text steg — Core/Main native
+
+Detect/extract:
+
+- zero-width spaces/joiners;
 - bidi controls;
-- NBSP/non-breaking whitespace;
-- trailing-space/tab binary encodings;
+- variation selectors;
+- NBSP and unusual whitespace;
+- tabs/spaces binary encodings;
 - Unicode normalization deltas;
-- suspicious homoglyph mixtures.
+- mixed-script/homoglyph anomalies.
 
-No runtime need for `stegsnow` once parity is tested.
+`stegsnow` can remain a DEV oracle, not a runtime dependency.
 
----
+## 7.7 Audio steg — Core/Main + Full extensions
 
-# 8. Image / visual analysis
+### Core
 
-## Main
-
-- raw PNG/GIF/APNG/JPEG structure: Havk native;
-- visual transforms: Rust image stack where representation loss is acceptable;
-- OCR: **Tesseract C/M**;
-- barcode/QR: **zxing-cpp C/M**;
-- generated bitplanes/frames: immutable child artifacts.
-
-## Experimental replacements
-
-- `rxing`: **C/E**; promising Rust port but not yet the default over ZXing-C++.
-- `ocrs`: **C/E**; attractive Rust OCR, but upstream still describes it as early-stage relative to Tesseract coverage.
-
-## ImageMagick — **F/M fallback**
-
-Keep in full for obscure conversions/transformations. Do not make it the first backend for simple pixel operations that Havk can perform deterministically.
-
-## libwebp tools — **F/M specialist**
-
-Build current libwebp source and expose `webpmux`-equivalent operations for WebP container/chunk/frame inspection. This closes a format gap without routing all images through ImageMagick.
-
----
-
-# 9. Audio and media steg/forensics
-
-## FFmpeg / ffprobe — **C/M**
-
-Primary decoder/demuxer/stream extractor. Use upstream source release in a builder when no official Linux binary is provided by the project.
-
-Capabilities:
-
-- stream/container metadata;
-- audio extraction to bounded PCM;
-- video frame extraction;
-- attachment/data stream extraction;
-- spectrogram fallback (`showspectrumpic`);
-- codec/container normalization into analysis-friendly child artifacts.
-
-Recent CTF write-ups continue to hide flags in audio spectrograms, so spectrogram generation is a core capability, not a niche extra.
-
-## Native Havk audio — **C/M after tests**
-
-- waveform statistics;
-- FFT/spectrogram renderer;
+- FFmpeg/ffprobe for decode/demux;
+- native PCM sample inventory;
+- FFT/spectrogram;
 - DTMF via Goertzel;
-- channel diff;
+- channel difference;
 - PCM LSB extraction;
-- silence/tone segment detection.
+- silence/tone segmentation.
 
-## multimon-ng — **F/M**
+### Full
 
-Use for radio/modem schemes beyond DTMF.
+- `multimon-ng` for radio/modem protocols;
+- `minimodem` for FSK-style modem signals;
+- SSTV decoder (experimental until corpus quality is sufficient).
 
-## minimodem — **F/M**
+## 7.8 QR/barcode/OCR
 
-Add it. It gives batch-friendly FSK modem decoding (Bell/RTTY/TDD/etc.) and is more realistic for signal-style CTF audio than trying to implement every modem in Havk.
-
-## SSTV decoder — **F/E**
-
-Useful CTF capability, but the common Python projects are materially less mature/reputable than FFmpeg/multimon. Keep it experimental until a golden corpus is established.
-
----
-
-# 10. Archives, compression and carving
-
-## 7-Zip / `7zz` — **C/M**
-
-Use official upstream Linux x64/arm64 binary where available, pinned in `tools.lock.toml`. It covers archives plus many filesystem/disk/container formats without mounting/root privileges.
-
-## Binwalk v3 — **C/M**
-
-Official upstream Rust rewrite; excellent for embedded signatures and extraction. Use subprocess worker for large inputs because the library scan API may require full-file memory and extraction still invokes format handlers/tools.
-
-Upstream: https://github.com/ReFirmLabs/binwalk
-
-## Havk raw carver — **C/M**
-
-A small signature-aware carver complements Binwalk. It should emit offsets and child artifacts, not pretend to be a complete filesystem recovery engine.
-
-## unblob — **F/M**
-
-Promote to full/main rather than experimental. It has an active release cadence, broad format support and recent hardening. Use as a **deep extraction fallback**, not automatically alongside Binwalk on every file.
-
-Upstream: https://github.com/onekey-sec/unblob
-
-## Deark — **F/M**
-
-See metadata section: valuable for legacy/obscure formats and thumbnails/embedded assets that Binwalk/7z may not decode usefully.
-
-## Archive crypto
-
-### bkcrack — **C/M**
-
-Strongly justified by current CTF evidence. 2025 and 2026 write-ups repeatedly exploit predictable PNG/EXE/plaintext structures against ZipCrypto.
-
-Recent examples:
-- TJCTF 2025 known-plaintext attack;
-- RITSEC CTF 2026 `Zipped Up`;
-- Pengcheng Cup 2025 multiple ZipCrypto challenges.
-
-Upstream: https://github.com/kimci86/bkcrack
-
-### fcrackzip — **C/M legacy specialist**
-
-Cheap dictionary/brute compatibility for traditional ZIP encryption.
-
-### pdfcrack — **C/M specialist**
-
-Keep local to protected-PDF workflow, not as a generic password-cracking service.
-
-## Archive repair
-
-Native + trusted tools should cover:
-
-- EOCD search/reconstruction candidates;
-- central/local header mismatch;
-- truncated ZIP diagnostics;
-- `zip -FF` compatibility path where needed;
-- encryption scheme identification before choosing attacks.
+| Backend | Tier |
+|---|---|
+| zxing-cpp | core/main |
+| rxing | core/experimental replacement |
+| Tesseract | core/main |
+| ocrs | core/experimental replacement |
 
 ---
 
-# 11. PDF, Office, email and document forensics
+# 8. Network / PCAP forensics — revised design
 
-## qpdf — **C/M**
+The old `pcap_analyze` + `pcap_extract` split is insufficient. Wireshark's own distribution contains separate tools because these are separate forensic operations.
 
-Excellent MCP backend: noninteractive, validation/repair/decrypt, JSON-capable, active, and current official Linux x86_64/aarch64 binaries include checksums/signatures. Current release verified during research: 12.4.2 (2026-09-27).
+At research time, the current stable Wireshark release is **4.6.9 (2026-09-23)**. Build the upstream source once in the Docker builder and copy only the required CLI binaries/libraries into runtime.
 
-Upstream: https://github.com/qpdf/qpdf/releases
+Official documentation index:
 
-## pdfcpu — **C/M secondary validator/toolbox**
+- Wireshark CLI guide: https://www.wireshark.org/docs/wsug_html_chunked/
+- TShark: https://www.wireshark.org/docs/man-pages/tshark.html
+- capinfos: https://www.wireshark.org/docs/man-pages/capinfos.html
+- captype: https://www.wireshark.org/docs/man-pages/captype.html
+- editcap: https://www.wireshark.org/docs/man-pages/editcap.html
+- mergecap: https://www.wireshark.org/docs/man-pages/mergecap.html
+- reordercap: https://www.wireshark.org/docs/man-pages/reordercap.html
+- text2pcap: https://www.wireshark.org/docs/man-pages/text2pcap.html
+- dumpcap: https://www.wireshark.org/docs/man-pages/dumpcap.html
+- sharkd: https://www.wireshark.org/docs/man-pages/sharkd.html
 
-Add it. This is a mature Go PDF CLI/library with broad validation/manipulation capabilities and excellent release packaging. v0.16.0 (2026-09-28) includes security hardening and Linux binaries with checksums/SBOMs.
+## 8.1 Wireshark CLI suite classification
 
-Why both qpdf and pdfcpu?
+| Utility | Tier | MCP role | Why separate |
+|---|---|---|---|
+| **tshark** | core/main | packet dissection, filter, fields, streams, exports, taps/stats | protocol engine |
+| **capinfos** | core/main | `pcap_info` | fast capture metadata/stats without packet-table dumping |
+| **captype** | core/main internal | type detection inside `pcap_info`/`pcap_validate` | too narrow for its own public tool |
+| **editcap** | core/main | `pcap_transform`, `pcap_secrets` | slice/split/dedup/chop/time-shift/encapsulation/secrets |
+| **mergecap** | core/main | `pcap_merge` | chronological/appended multi-capture merge |
+| **reordercap** | core/main | `pcap_reorder` | timestamp-order repair without conflating it with general editcap transforms |
+| **text2pcap** | core/main | `pcap_from_text` | converts hex/text records to analyzable capture; can synthesize headers |
+| **dumpcap** | core/main binary, runtime-disabled | `pcap_capture` | live capture, ring buffer, autostop; explicit privilege mode only |
+| **sharkd** | core/experimental internal backend | alternate implementation for repeated packet/frame/filter/follow queries | JSON-RPC, same dissector engine; official warning says never expose to untrusted users |
+| **rawshark** | not public by default | possible low-level specialist | low value vs tshark/sharkd for current Havk API |
 
-- qpdf remains excellent for object structure, repair, decrypt and JSON;
-- pdfcpu provides an independent parser/validator and useful attachment/image/signature operations;
-- differential disagreement on malformed CTF PDFs is itself useful evidence.
+## 8.2 Why these are not redundant
 
-Upstream: https://github.com/pdfcpu/pdfcpu/releases
+### capinfos
 
-## Poppler — **C/M**
+This is a first-pass evidence orientation tool: capture format, encapsulation, packet counts, file/data size, duration, timestamps, packet rate, etc. Recent PCAP forensic write-ups still begin with it because this information often exposes capture anomalies before packet analysis.
 
-Retain for rendering, text/images and attachments.
+Semantic result should include normalized fields, not raw stdout.
 
-## Didier Stevens `pdfid.py` / `pdf-parser.py` — **C/M compatibility/suspicious-object specialist**
+### editcap
 
-Do not discard yet. They remain useful in CTF/security workflows for raw suspicious-object inspection even when qpdf/pdfcpu exist. Once Havk's own PDF semantic layer reaches parity, these can become DEV or be removed.
+`editcap` should back a typed transformation API, not a free-form flag string. Useful forensic operations include:
 
-## `lopdf` — **C/E**
+- convert capture format;
+- packet-number slicing;
+- time-range slicing;
+- split by packet count/time interval;
+- remove duplicates;
+- timestamp shift/strict adjustment;
+- snaplen/chop selected bytes;
+- encapsulation conversion;
+- capture-secret extraction/injection.
 
-Useful Rust parser, but hostile/malformed PDF robustness must be proven on the Havk corpus. Execute in a worker. It is an experimental path, not a reason to remove qpdf.
+All outputs are child artifacts.
 
-## oletools — **C/M**
+### mergecap
 
-Macros/OLE/RTF/Office-specific knowledge remains valuable and lacks a clearly superior Rust replacement.
+Multi-file captures occur in CTFs and real acquisitions. `mergecap` combines multiple captures chronologically by default or in input order when requested.
 
-## msoffcrypto-tool — **C/M**
+Recent CTF example: a 2025 247CTF network challenge starts by merging three PCAPs before MPTCP analysis.
 
-For Office encryption/decryption with provided/derived password.
+### reordercap
 
-## Rust `mail-parser` — **C/M**
+Timestamp disorder can prevent correct reconstruction. A documented CTF example used `reordercap` to restore packet ordering before analyzing an ICMP-tunnel capture.
 
-Add direct EML/MIME parsing as a first-class capability. It is a safe Rust parser used in a production mail ecosystem, handles MIME/charsets/attachments, and avoids shelling out merely to enumerate email parts. PST remains a separate full backend.
+Write-up: https://ctftime.org/writeup/29374
 
-## libpff / pff-tools — **F/M**
+### text2pcap
 
-For PST/OST containers where required.
+Useful when the challenge gives raw hex dumps/application payload rather than a PCAP. It supports timestamp/direction parsing, regex extraction, and synthetic Ethernet/IP/TCP/UDP/SCTP headers.
 
----
+This is a distinct semantic operation: **construct an evidence artifact that Wireshark dissectors can understand**.
 
-# 12. SQLite and database forensics
+### dumpcap
 
-The previous `database_inspect` was too shallow.
+`dumpcap` is for capture, not analysis. It has ring buffers, packet/file/time autostop and capture filters. Wireshark intentionally keeps capture functionality in a smaller component.
 
-## `rusqlite` — **C/M**
+Havk should ship it but hide `pcap_capture` unless explicit live mode is enabled.
 
-Use immutable/read-only connections for:
+### sharkd
 
-- schema;
-- tables/views/indexes;
-- bounded row queries;
-- BLOB inventory/extraction;
-- WAL/sidecar presence inventory;
-- timestamp/text heuristic summaries.
+This deserves experimental evaluation. It exposes a JSON-RPC API with methods such as:
 
-## deleted SQLite data
+- `load`;
+- `analyse`;
+- `check`;
+- `complete`;
+- `frames`;
+- `frame`;
+- `follow`;
+- `download`;
+- `iograph`;
+- `intervals`;
+- `tap`.
 
-This is a separate forensic problem. A 2025 forensic survey emphasizes freelist/WAL/deleted-record recovery and the false-positive tradeoffs of existing tools.
-
-### `sqlite-forensic` / `sqlite4n6` — **F/E**
-
-Add to experimental evaluation. It is a new Rust project, but unlike many rewrites it publishes corpus-based comparisons against independent tools/ground truth and explicitly focuses on read-only recovery from WAL, rollback journal, freelist/free space, dropped schema and deleted rows.
-
-It is still too new for Main, but is a strong experimental candidate.
-
-Upstream: https://github.com/SecurityRonin/sqlite-forensic
-
-### DC3 `sqlite-dissect` — **DEV oracle / F/E optional**
-
-Established forensic reference from the DoD Cyber Crime Center; useful for differential testing but aggressive carving can generate false positives. Do not make it the only source of truth.
-
-### SQLite `.recover`
-
-Useful fallback/oracle, but documented recovery gaps mean it should not be labeled complete forensic recovery.
-
----
-
-# 13. PCAP / network forensics
-
-## tshark + capinfos + editcap — **C/M**
-
-Keep as the protocol-dissection foundation. No Rust/Go replacement approaches Wireshark's dissector breadth.
-
-The public API should copy the **granularity** of the supplied Wireshark-MCP, while normalizing its outputs into Havk artifacts/observations.
-
-## pcapfix — **C/M**
-
-Small, useful repair backend for malformed/truncated capture structures. Repairs always create a child artifact.
-
-## Zeek — **F/M**
-
-Add it. Zeek is a mature network analysis framework with strong institutional use and structured logs. It complements tshark:
-
-- tshark: packet/field/stream level;
-- Zeek: connection/session/application event logs.
-
-For large network-forensics challenges, Zeek can give the agent a compact high-level corpus (`conn`, `dns`, `http`, `ssl/tls`, files, notices) instead of forcing it to query millions of packets.
-
-Upstream: https://github.com/zeek/zeek
-
-## Suricata — **OPT, not default**
-
-Excellent IDS/EVE engine, but for Havk CTF forensics it substantially overlaps Zeek + signature scanning and adds another large rules ecosystem. Keep as optional enrichment rather than normal full image.
-
-## Native CTF decoders — **C/M**
-
-Recent 2025 write-ups still require:
-
-- `usbhid.data` extraction + keyboard reconstruction;
-- DNS/exfil reconstruction;
-- raw TCP stream payload reconstruction.
-
-Havk should provide native semantic decoders atop tshark fields for common CTF patterns rather than make the model write one-off Python each time.
-
----
-
-# 14. Disk / filesystem / recovery
-
-## The Sleuth Kit — **C/M**
-
-Core filesystem-forensics backend: partition layout, filesystem metadata, deleted listings, inode/file extraction. Current upstream 4.15.0 includes multiple bounds/overflow fixes, reinforcing why current pinned upstream matters.
-
-Upstream: https://github.com/sleuthkit/sleuthkit/releases
-
-## libewf / ewf-tools — **C/M**
-
-Needed for E01/Ex01. Use current upstream source build instead of ancient distro builds. Normal workflow should be one-shot reading/export, not a long-lived `ewfmount` FUSE mount.
-
-## 7zz — **C/M fast path**
-
-Use for read-only inspect/extract of formats it can understand without FUSE/root; TSK remains the forensic-aware backend.
-
-## PhotoRec — **F/M**
-
-Reconsider the earlier exclusion. PhotoRec can be scripted via `/cmd`, so it is realistic for MCP as a long-running recovery Task. It is mature, widely used, and supports hundreds of file signatures.
-
-Use for signature recovery when filesystem metadata is absent/destroyed; do not confuse it with TSK's metadata-aware deleted-file extraction.
-
-## TestDisk — **not exposed by default**
-
-Although scriptable, its partition-repair/write capabilities increase destructive risk and are not necessary for a read-only CTF forensic MCP. If ever added, make a separate explicitly destructive tool/profile.
-
-## bulk_extractor — **F/M**
-
-Add it. Active again with v2.2.0 in 2026 and recent hostile-input/bounds maintenance. It extracts forensic features without depending on filesystem parsing and complements TSK/PhotoRec.
-
-Use cases:
-
-- email/URL/domain/IP feature extraction;
-- encoded/fragment scanning;
-- feature histograms;
-- triage of large raw images.
-
-## Plaso/log2timeline — **F/M**
-
-Add it for super-timeline/targeted timeline generation. It solves a distinct agent problem: correlating timestamped events across many artifact types. Heavy enough to be a Task/full backend, but too useful to omit from a serious forensic profile.
-
-Upstream: https://github.com/log2timeline/plaso
-
-## qemu-img — **F/M**
-
-Conversion/info for QCOW/VMDK/VHD when 7zz/TSK paths are insufficient.
-
-## `dissect.target` — **not bundled by default**
-
-Technically strong, but AGPL and substantial overlap with the full forensic stack make it better as an optional external integration than a default Havk dependency.
-
----
-
-# 15. Windows forensic artifacts
-
-## EVTX Rust parser (`evtx`) — **F/M**
-
-Mature enough to use as a typed parser, but still execute in a worker. Useful for exact event parsing/querying without always invoking a larger hunting suite.
-
-## Hayabusa — **F/M optional copyleft bundle**
-
-Very strong reputation for fast EVTX/Sigma timeline/hunting, Rust, active 2026, signed binaries. Current project license is AGPLv3, so bundle/licensing policy should be explicit. It is valuable enough to support, but may belong in `full-copyleft` rather than the minimal distributable image depending on Havk's licensing goals.
-
-Upstream: https://github.com/Yamato-Security/hayabusa
-
-## Chainsaw — **F/M optional copyleft bundle**
-
-Also strong: active 2026, precompiled binaries, Rust, hunts EVTX and additionally analyzes artifacts such as MFT/SRUM/registry-related data. GPLv3. There is overlap with Hayabusa; Havk does not need to run both automatically. Expose one semantic `win_hunt` operation and choose backend/capability.
-
-Upstream: https://github.com/WithSecureOpenSource/chainsaw
-
-## `mft` Rust — **F/E**
-
-Good promotion candidate but not yet equal to the strongest Windows forensic ecosystem in reputation. Differential-test against TSK/Chainsaw and known MFT corpora.
-
-## Registry
-
-- `regipy` — **F/M**;
-- libyal/libregf path — **F/M** where needed;
-- ForensicRS registry components — **F/E**.
-
-## Prefetch / LNK / PST / related
-
-- libyal `libscca` (Prefetch) — **F/M**;
-- libyal `liblnk` — **F/M**;
-- libyal `libpff` — **F/M**;
-- ForensicRS replacements — **F/E** until corpus parity.
-
----
-
-# 16. Memory forensics
-
-## Volatility 3 — **F/M**
-
-Default memory backend. Current verified release: 2.28.2 (2026-09-17). Modern CTF memory write-ups continue to revolve around process/network/file/plugin analysis with Volatility.
-
-Expose semantic operations; do not expose arbitrary plugin execution by default.
-
-## MemProcFS — **F/E / optional copyleft alternative**
-
-Add it to evaluation rather than ignoring it. It has strong adoption (~4k GitHub stars in current search), official Linux x64/aarch64 binaries, a Rust API, batch forensic mode, YARA support, process/network/registry/file recovery, timelines and SQLite forensic output.
-
-Reasons not to make it Main immediately:
-
-- AGPLv3 / bundled-license considerations;
-- many workflows are naturally virtual-filesystem/mount oriented;
-- Havk must prove clean one-shot/API integration without long-lived mount state;
-- overlap with Volatility 3 and Windows artifact parsers.
-
-Its batch forensic mode is particularly MCP-friendly and should be tested.
-
-Upstream: https://github.com/ufrisk/MemProcFS
-
----
-
-# 17. Browser / mobile forensics
-
-These are absent from the original draft and are realistic forensic CTF domains.
-
-## Hindsight — **F/M**
-
-Add a browser-forensics backend for Chromium-family artifacts and supported browser history/session/cache structures. Browser challenges otherwise force repeated ad-hoc SQLite interpretation.
-
-## iLEAPP — **F/M optional mobile bundle**
-
-Strong project activity and ecosystem reputation; current 2026 releases provide Linux x64/arm64 AppImages and checksums. CLI mode is explicit. Recent releases also improve direct forensic image/raw support.
-
-Upstream: https://github.com/abrignoni/iLEAPP/releases
-
-## ALEAPP — **F/M optional mobile bundle**
-
-Android counterpart, same advantages: current release cadence, CLI, Linux x64/arm64 AppImages and `SHA256SUMS.txt`.
-
-Upstream: https://github.com/abrignoni/ALEAPP/releases
-
-These should not inflate `core`, but a serious `full` forensic image should at least support optional installation/tool profiles for them.
-
----
-
-# 18. Recommended acquisition policy (no distro-version dependency)
-
-The runtime image should not rely on whatever version Debian/Ubuntu happens to package.
-
-Priority:
-
-1. **official upstream prebuilt binary** + published checksum/signature/attestation;
-2. **official upstream source tag/tarball** + builder-stage compile;
-3. official language package only when that is the upstream distribution model (Python/Ruby crates/wheels/gems), pinned by hash;
-4. distro package only for build/bootstrap dependencies, not as the authoritative forensic tool version.
-
-Do not fetch `/releases/latest` during Docker build. Resolve latest versions in an updater workflow and commit the result.
-
-Example:
-
-```toml
-# tools.lock.toml
-
-[yara_x]
-version = "1.21.0"
-source = "upstream"
-kind = "source-or-official-artifact"
-commit = "7b2637d4655155fdfaf68177edadb9a39406ece0"
-
-[magika]
-version = "1.1.0"
-kind = "github-release"
-asset_x86_64 = "magika-cli-x86_64-unknown-linux-gnu.tar.xz"
-sha256_x86_64 = "..."
-asset_aarch64 = "magika-cli-aarch64-unknown-linux-gnu.tar.xz"
-sha256_aarch64 = "..."
-
-[qpdf]
-version = "12.4.2"
-kind = "github-release"
-sha256_x86_64 = "db367d897829f22c4198ce1094143c9d467bd6ee7dfabc44ba6f02056b24f8b1"
-sha256_aarch64 = "8fd9d009eb0838398180a603f2cf76531e5c68a4ecc8847598e0a1ccb1d3b600"
-```
-
-The updater should:
+That shape is naturally compatible with repeated agent queries and avoids repeatedly starting tshark. However, Wireshark's official manual warns that unfiltered sharkd access may lead to information disclosure or arbitrary command execution. Therefore:
 
 ```text
-query upstream release/tag
-  ↓
-verify provenance/checksum/signature where available
-  ↓
-download/build candidate
-  ↓
-run doctor capability probes
-  ↓
-run golden corpus + differential corpus
-  ↓
-measure image footprint
-  ↓
-open PR updating tools.lock.toml
+MCP client
+   ↓
+Havk typed semantic layer
+   ↓
+isolated worker
+   ↓
+sharkd console JSON-RPC over local pipe
 ```
+
+Never:
+
+```text
+MCP client → open sharkd TCP socket
+```
+
+Promote only after corpus/performance/security testing proves it materially improves repeated-query workflows.
+
+## 8.3 pcapfix
+
+Repository: https://github.com/Rup0rt/pcapfix
+
+`pcapfix` 1.1.7 is old (2021 release) but narrowly scoped, known, and still useful for corrupted pcap/pcapng headers/blocks. It supports pcap and pcapng, deep scan and soft packet detection.
+
+Classification:
+
+```text
+core/main specialist
+```
+
+Reason: no clearly superior, mature modern replacement was found for this exact repair role. Age alone does not disqualify a stable, narrow file-repair utility. Every repair output is a new child artifact; the original is never overwritten.
+
+## 8.4 Zeek — Full/Main
+
+Repository: https://github.com/zeek/zeek
+
+Zeek complements rather than replaces tshark:
+
+```text
+tshark/Wireshark suite → packet/frame/field/stream level
+Zeek                    → connection/session/application event logs
+```
+
+Use it for larger PCAPs where the model benefits from compact structured connection/DNS/HTTP/TLS/file-event datasets.
+
+Do not automatically run Zeek on every small CTF capture.
+
+## 8.5 Other network candidates
+
+| Tool | Decision | Reason |
+|---|---|---|
+| tcpdump | optional/live fallback | highly reputable, but redundant for saved-PCAP analysis; dumpcap preferred privileged capture component |
+| Suricata | optional separate detection bundle | strong IDS but rule ecosystem/overlap is outside minimal CTF forensic core |
+| tcpflow | reject default | stream reconstruction already covered by tshark/sharkd; project lineage less active |
+| NetworkMiner | reject default | GUI/.NET workflow poorly matched to headless MCP |
+| Arkime | reject current scope | server/indexing platform too heavy for CTF artifact workflow |
+| ngrep | reject public tool | simple payload search is covered by `pcap_search` |
+| rawshark | internal/watch | no compelling semantic gap yet |
 
 ---
 
-# 19. Expanded semantic MCP API
+# 9. Network semantic MCP API
 
-The purpose of this section is to define **agent intents**, not mirror backend executable names.
-
-The complete catalog can be large, but the server should expose a static subset selected at startup with `--tool-profile`. A 60+ tool `all` profile is acceptable for specialized clients; the default `ctf` profile should expose the high-frequency subset to control prompt/schema cost.
+The following replaces the old two-tool PCAP API.
 
 Legend:
 
-- **S** = normally synchronous
-- **A** = server may convert to MCP Task / fallback job
-- **C** = core image
-- **F** = full image required
+- **S**: normally synchronous;
+- **T**: may become MCP Task / fallback job;
+- every file-changing operation creates a child artifact.
 
-## 19.1 Control / artifact layer
+| MCP tool | Intent | Main backend | Exec |
+|---|---|---|---|
+| `pcap_info` | capture format, encapsulation, interfaces, packet count, sizes, duration, timestamps, rates, hashes | capinfos + captype | S |
+| `pcap_validate` | readability, structural anomalies, interface blocks, timestamp sanity, parser diagnostics | capinfos + tshark + native | S |
+| `pcap_repair` | repair damaged pcap/pcapng to child artifact | pcapfix | T |
+| `pcap_transform` | convert/slice/split/dedup/timeshift/snaplen/chop/encapsulation | editcap | S/T |
+| `pcap_secrets` | inspect/extract/inject supported capture secrets with sensitive-result handling | editcap | S |
+| `pcap_merge` | merge capture artifacts chronologically or append-order | mergecap | T |
+| `pcap_reorder` | sort frames by timestamp | reordercap | T |
+| `pcap_from_text` | parse hex/text dump, timestamp/direction, synthesize L2/L3/L4 headers | text2pcap | S/T |
+| `pcap_packets` | pageable packet list, semantic columns, display filter | tshark; exp sharkd | S |
+| `pcap_packet` | detailed protocol tree + bounded raw bytes + neighboring context | tshark; exp sharkd | S |
+| `pcap_filter` | validate display/capture filter, protocol/field lookup/completion | tshark glossary; exp sharkd `check`/`complete` | S |
+| `pcap_fields` | typed extraction of selected known fields with row/byte ceiling | tshark | S/T |
+| `pcap_search` | text/hex/field/pattern search over packets/streams | tshark + native | S/T |
+| `pcap_follow` | TCP/UDP/HTTP/etc. reassembled stream preview or artifact | tshark; exp sharkd | S/T |
+| `pcap_export` | exported protocol objects/files | tshark | T |
+| `pcap_stats` | endpoints, conversations, protocol hierarchy, I/O, expert info, response-time stats | tshark taps; exp sharkd tap/iograph | S/T |
+| `pcap_protocol` | semantic analyzer for DNS/HTTP/TLS/SMB/FTP/SMTP/DHCP/QUIC/MQTT/etc. | tshark | S/T |
+| `pcap_ctf_decode` | USB HID, DNS exfil, ICMP payload, basic covert-channel reconstruction | tshark fields + native Rust | S/T |
+| `network_logs` | generate/query Zeek connection/application logs | Zeek | T |
+| `pcap_capture` | live capture with filter, snaplen, autostop, ring buffer | dumpcap | T; disabled by default |
 
-| Tool | Operations / intent | Exec |
+## 9.1 Why `pcap_protocol` remains one tool
+
+Do not create `dns_analyze`, `http_analyze`, `tls_analyze`, `mqtt_analyze`, etc. for every dissector. That would recreate HexStrike's schema-count problem.
+
+Use a typed protocol enum and backend mapping:
+
+```json
+{
+  "artifact_id": "art_capture",
+  "protocol": "dns",
+  "operation": "summary",
+  "filter": null,
+  "limit": 500
+}
+```
+
+The server knows the correct tshark fields/taps for each supported semantic protocol mode.
+
+## 9.2 CTF-specific network decoders
+
+`pcap_ctf_decode` should have explicit modes rather than arbitrary scripts:
+
+```text
+usb_keyboard
+usb_mouse
+usb_storage_summary
+dns_labels
+dns_txt
+icmp_payload
+tcp_payload_concat
+http_body_candidates
+timing_channel_basic
+ip_id_channel_basic
+```
+
+Some modes can be experimental at first. The point is to stop forcing the agent to write ad-hoc Python every time a common CTF representation reappears.
+
+---
+
+# 10. PDF/document forensics — mutool reassessment
+
+Gemini's suggestion to use only `mutool` is technically understandable because `mutool` is a real Swiss-army knife. It is **not** the best default architecture for Havk unless licensing and parser diversity are intentionally traded away.
+
+## 10.1 What mutool actually gives us
+
+Current MuPDF docs expose, among others:
+
+- `mutool show`: print object dictionaries and decoded/raw streams, trailer/xref, object paths; can force repair;
+- `mutool clean`: rewrite/repair, garbage collect, decompress/recompress streams, decrypt, pretty-print;
+- `mutool draw`: render pages, extract text/structured text including JSON/XML, OCR support, memory limits/low-memory mode;
+- `mutool extract`: extract images and fonts;
+- `mutool info`: page objects/resources information;
+- `mutool pages`: page boxes/rotation/user units;
+- `mutool grep`: content search;
+- `mutool audit`: object/operator/storage usage report;
+- `mutool run`: JavaScript access to low-level PDF APIs, including embedded files.
+
+This is extremely attractive for a forensic MCP.
+
+## 10.2 Why not `mutool` only
+
+### 1. License
+
+MuPDF open-source releases are **AGPL**; Artifex offers a commercial alternative. Bundling it in a Docker-delivered Havk product requires an explicit licensing decision and compliance review.
+
+This document is not legal advice, but the license is strong enough that it should affect default-backend architecture.
+
+### 2. Independent parser disagreement is useful forensic evidence
+
+Malformed/adversarial PDFs regularly trigger different parser behavior. A forensic system benefits from:
+
+```text
+qpdf validation/object model
+pdfcpu independent validator
+mutool optional parser/renderer
+Didier security-oriented raw inspection
+```
+
+Disagreement can itself be surfaced as an observation.
+
+### 3. qpdf has an MCP-friendly JSON representation
+
+qpdf JSON v2 provides a stable object/document representation designed for machine processing. That makes normalization safer than parsing arbitrary human CLI text.
+
+### 4. mutool extraction is not one universal attachment command
+
+`mutool extract` directly focuses on images/fonts. Embedded/associated files can be accessed through MuPDF's document APIs / `mutool run`, which is powerful but means a “one binary solves everything” claim needs a custom scripting layer anyway.
+
+## 10.3 Recommended PDF backend tiers
+
+| Backend | Tier | Role |
 |---|---|---|
-| `doctor` | backend capability probes, lock verification, architecture support, corpus/version warnings | S |
-| `artifact_query` | list, filter by parent/type/origin, provenance tree, children | S |
-| `artifact_read` | bounded byte/text range, preview, small structured decode | S |
-| `artifact_export` | copy/materialize artifact for client/workspace; never mutate source | S |
-| `job` | fallback status/result/cancel when MCP Tasks unsupported | S |
+| **qpdf** | core/main | structure, JSON object model, validation, repair, decrypt, normalization |
+| **pdfcpu** | core/main | independent Go parser/validator, attachments/images/forms/signatures, additional corruption detection |
+| **pdfid.py** | core/main security specialist | quick suspicious-key triage |
+| **pdf-parser.py** | core/main compatibility/specialist | object/stream inspection familiar in CTF/security workflows |
+| **mutool** | optional `pdf-agpl` or full/main if licensing accepted | independent parser, render/text/OCR, object view, repair, resources, audit, JS API |
+| **Poppler CLI** | optional core/full depending final license/footprint decision | `pdftotext`, `pdfimages`, `pdfdetach` compatibility |
+| **lopdf** | core/experimental | Rust parser; worker only until hostile-PDF corpus proves robustness |
 
-## 19.2 Generic file / metadata
+`pdfcpu` is especially interesting for Havk because current releases provide Linux binaries/checksums/SBOMs, stateless configuration support, cancellation-aware APIs, resource limits and recent malformed-PDF security hardening.
 
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `file_identify` | magic, MIME, extension mismatch, Magika second opinion, format candidates | native + Magika | S |
-| `file_hash` | sha256, optional md5/sha1, chunk/range hash | native | S |
-| `file_strings` | ASCII/UTF-8/UTF-16, offsets, regex/filter, bounded paging | native | S |
-| `file_entropy` | whole-file, windowed map, boundary candidates | native | S |
-| `file_scan` | YARA-X rulesets, CTF indicators, user rule artifact | YARA-X | S/A |
-| `file_structure` | known container/chunk/marker tree, appended data, polyglot candidates | native + format adapters | S |
-| `file_repair` | PNG, ZIP, selected magic/header repairs; emits child artifact + patch log | native | S |
-| `metadata_read` | all/summary/GPS/comments/software/time/thumbnail refs | ExifTool; exp OxiDex | S |
-| `metadata_extract` | thumbnails, ICC/XMP/embedded metadata blocks as artifacts | ExifTool/Deark | S/A |
+## 10.4 Modern CTF evidence for mutool
 
-## 19.3 Carving and archives
+Mutool is absolutely worth supporting. Recent CTF PDF write-ups use it for tasks such as:
 
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `carve_scan` | embedded signatures, raw signature candidates, offsets, confidence | Binwalk + native | S/A |
-| `carve_extract` | selected candidate extraction, bounded recursive extraction | native/Binwalk; full unblob/Deark | A |
-| `archive_list` | members, sizes, compression, encryption, suspicious paths, ratios | 7zz/format parser | S |
-| `archive_extract` | selected members/all under policy limits | 7zz | S/A |
-| `archive_repair` | ZIP structure diagnosis/repair candidate, child artifact | native + zip tooling | A |
-| `archive_crypto` | detect scheme, dictionary attack, known-plaintext ZipCrypto, unlock/decrypt | bkcrack/fcrackzip/pdfcrack where relevant | A |
+- extracting embedded/custom fonts from redacted PDFs;
+- extracting a hidden page image from a PDF;
+- decompressing PDF streams (`mutool clean -d`) before searching hidden content.
 
-## 19.4 Steganography
+Examples:
 
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `stego_triage` | format-aware plan: metadata/trailing/container/LSB/palette/JPEG/audio/text candidate summary | orchestration only | S |
-| `stego_lsb_scan` | bounded search over bit/channel/order/traversal, rank findings | native exp; zsteg oracle | S/A |
-| `stego_lsb_extract` | exact extraction parameters → artifact | native; zsteg fallback | S |
-| `stego_planes` | bit planes, channel planes, alpha, xor/difference planes | native | S |
-| `stego_palette` | palette indices, global/local tables, usage anomalies, remap visualization | native | S |
-| `stego_frames` | GIF/APNG/WebP frame list/extract/diff/composite | native/gifsicle/webpmux | S/A |
-| `stego_text` | zero-width, whitespace, bidi, variation selectors, homoglyph analysis/extract | native | S |
-| `stego_jpeg` | marker inventory + steghide/StegSeek/OutGuess/jsteg probe/extract | native + specialized CLIs | S/A |
-| `stego_statistics` | chi-square, RS, SPA with applicability/false-positive warnings | native experimental | S/A |
+- Securinets 2026 PDF custom-font challenge: mutool extraction used to recover the hidden font.
+- Nullcon CTF 2026: `mutool extract` exposed an image underneath apparent redaction.
 
-## 19.5 Image / OCR / barcode
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `image_info` | raw format/sample/palette/frame/color/alpha inventory | native | S |
-| `image_compare` | diff, xor, similarity map, alignment options | native | S/A |
-| `image_transform` | safe crop/scale/invert/channel visualization for analysis artifacts | native; ImageMagick fallback full | S |
-| `image_ocr` | OCR selected artifact/region/frame | Tesseract; exp ocrs | S/A |
-| `image_barcode` | QR/DataMatrix/Aztec/PDF417/1D decode, rotations/inversion | zxing-cpp; exp rxing | S |
-
-## 19.6 Media / audio
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `media_probe` | streams, codecs, duration, attachments, chapters, metadata | ffprobe | S |
-| `media_extract` | audio/video/data/subtitle/frame stream → child artifact | FFmpeg | A |
-| `audio_spectrogram` | spectrogram parameters, frequency range, generated image | native; FFmpeg fallback | S/A |
-| `audio_signal_decode` | DTMF core; full: minimodem/multimon protocols/SSTV | native + full backends | S/A |
-| `audio_stego` | PCM LSB/channel-diff/sample-bit extraction | native | S/A |
-
-## 19.7 PDF / Office / email / database
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `pdf_inspect` | validation, object/xref/stream tree, suspicious actions/JS/launch/embedded files, parser disagreement | qpdf + pdfcpu + pdfid/parser | S/A |
-| `pdf_extract` | text, images, attachments, selected streams/objects | Poppler/qpdf/pdfcpu | S/A |
-| `pdf_repair` | repair/normalize/decrypt using supplied password; child artifact | qpdf/pdfcpu | A |
-| `office_inspect` | OLE/OOXML structure, macros, embedded objects, encryption state | oletools + native archive view | S/A |
-| `office_extract` | macro/object/member extraction; decrypt with password | oletools/msoffcrypto/7zz | A |
-| `email_inspect` | headers, MIME tree, decoded bodies, attachment artifacts; full PST | Rust mail-parser; full libpff | S/A |
-| `database_inspect` | SQLite schema/query/blob/WAL sidecar inventory | rusqlite | S |
-| `database_recover` | deleted/WAL/journal/freelist recovery (full/experimental) | sqlite4n6 / oracle backends | A |
-
-## 19.8 PCAP / network
-
-This is deliberately more granular than the old two-tool design.
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `pcap_info` | capture metadata, interfaces, duration, packet/protocol summary | capinfos/tshark | S |
-| `pcap_packets` | pageable packet list with semantic columns + display filter | tshark | S |
-| `pcap_packet` | packet detail/tree, raw bytes/context around frame | tshark | S |
-| `pcap_search` | text/hex/field/display-filter search with pagination | tshark/native | S/A |
-| `pcap_fields` | typed extraction of selected known fields; bounded rows | tshark | S/A |
-| `pcap_follow` | TCP/UDP/HTTP/etc. stream reconstruction to preview/artifact | tshark | S/A |
-| `pcap_export` | HTTP/SMB/TFTP/etc. object extraction | tshark | A |
-| `pcap_protocol` | semantic protocol analyzers; server maps to correct fields/filters | tshark | S/A |
-| `pcap_stats` | endpoints, conversations, IO stats, expert info, service response stats | tshark | S/A |
-| `pcap_ctf_decode` | USB HID, DNS exfil, ICMP/raw payload, simple covert-channel decoders | tshark fields + native | S/A |
-| `network_logs` | full only: generate/query Zeek logs and file events | Zeek | A |
-
-## 19.9 Disk / filesystem / timeline
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `disk_info` | image/container type, EWF metadata, virtual-disk info | 7zz/libewf/qemu-img | S/A |
-| `disk_partitions` | partition/volume layout | TSK | S |
-| `fs_browse` | filesystem info, directory listing, deleted entries, inode metadata | TSK | S/A |
-| `fs_extract` | extract path/inode/range to artifact | TSK/7zz | A |
-| `fs_recover` | full: PhotoRec/raw recovery with policy filters | PhotoRec | A |
-| `forensic_features` | full: feature extraction from raw evidence | bulk_extractor | A |
-| `timeline_build` | full: targeted/super timeline | Plaso | A |
-
-## 19.10 Windows full-profile tools
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `win_evtx` | summary/query/export records, event gaps | evtx crate/worker | S/A |
-| `win_hunt` | Sigma/detection/timeline hunting | Hayabusa or Chainsaw capability-selected | A |
-| `win_registry` | hive inventory/keys/values/timestamps, selected artifact parsers | regipy/libyal; exp ForensicRS | S/A |
-| `win_mft` | records, paths, timestamps, resident data, anomaly filters | TSK / exp Rust mft | S/A |
-| `win_prefetch` | application run metadata and file references | libscca / exp Rust | S/A |
-| `win_lnk` | target/path/timestamps/volume/network info | liblnk | S |
-| `win_pst` | folder/message/attachment extraction | libpff | A |
-
-## 19.11 Memory full-profile tools
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `memory_info` | OS/kernel/layer/symbol diagnostics | Volatility 3 | A |
-| `memory_processes` | pslist/pstree/cmdline/handles/VAD-oriented summaries | Volatility 3 | A |
-| `memory_network` | sockets/connections | Volatility 3 | A |
-| `memory_modules` | DLL/modules/drivers/malfind-oriented views | Volatility 3 | A |
-| `memory_files` | file objects/filescan/dump selected object | Volatility 3 | A |
-| `memory_scan` | YARA-X/Volatility scanning pipeline | Volatility + YARA-X | A |
-| `memory_dump` | process/module/file/minidump artifacts | Volatility; exp MemProcFS | A |
-| `memory_batch` | experimental alternate batch forensic report | MemProcFS | A |
-
-## 19.12 Browser / mobile / wireless full tools
-
-| Tool | Operations | Backend | Exec |
-|---|---|---|---|
-| `browser_analyze` | browser history/downloads/cookies/cache/session/extension artifacts | Hindsight + SQLite layer | A |
-| `mobile_ios` | run selected iLEAPP parsers / report / artifact import | iLEAPP | A |
-| `mobile_android` | run selected ALEAPP parsers / report / artifact import | ALEAPP | A |
-| `wifi_analyze` | handshake info, AP/client inventory, PMKID/EAPOL diagnostics | hcxtools/aircrack-ng | A |
-| `wifi_crack` | bounded wordlist attack against provided candidate list | aircrack-ng | A |
+That justifies support; it does **not** justify eliminating qpdf/pdfcpu.
 
 ---
 
-# 20. Suggested default tool profiles
+# 11. PDF semantic MCP API
 
-Do not expose every tool to every model by default.
+Replace one `document_analyze` mega-tool with narrower operations.
 
-## `--tool-profile ctf` (recommended default)
+| MCP tool | Intent | Main backend | Optional/experimental | Exec |
+|---|---|---|---|---|
+| `pdf_triage` | version, pages, encryption, metadata, suspicious names/actions, validator disagreement | qpdf + pdfcpu + pdfid + ExifTool | mutool info/pages | S |
+| `pdf_objects` | trailer/xref/object tree, selected object, raw/decoded stream | qpdf JSON + pdf-parser | mutool show, lopdf | S/T |
+| `pdf_search` | names/keys/text/decoded streams/YARA-X patterns | pdf-parser + qpdf-normalized streams + native/YARA-X | mutool grep/show | S/T |
+| `pdf_extract` | images, attachments, fonts, selected streams/objects | qpdf/pdfcpu + specialist extractors | mutool extract/run, Poppler | T |
+| `pdf_render` | selected pages/regions to image; OCR-ready output | optional mutool or chosen renderer | Poppler/Tesseract | T |
+| `pdf_repair` | repair/normalize/decompress to child artifact | qpdf + pdfcpu | mutool clean | T |
+| `pdf_decrypt` | decrypt known password to child artifact | qpdf/pdfcpu | mutool clean | T |
+| `pdf_audit` | object/storage/operator/resource anomalies, cross-parser disagreement | qpdf + pdfcpu + native metrics | mutool audit | S/T |
 
-High-frequency subset:
-
-```text
-doctor
-artifact_query artifact_read artifact_export job
-file_identify file_hash file_strings file_entropy file_scan file_structure file_repair
-metadata_read metadata_extract
-carve_scan carve_extract
-archive_list archive_extract archive_repair archive_crypto
-stego_triage stego_lsb_scan stego_lsb_extract stego_planes stego_palette
-stego_frames stego_text stego_jpeg
-image_info image_compare image_ocr image_barcode
-media_probe media_extract audio_spectrogram audio_signal_decode audio_stego
-pdf_inspect pdf_extract pdf_repair office_inspect office_extract
-email_inspect database_inspect
-pcap_info pcap_packets pcap_packet pcap_search pcap_follow pcap_export pcap_ctf_decode
-disk_info disk_partitions fs_browse fs_extract
-```
-
-This is intentionally larger than Claude's 21 tools but still avoids loading memory/mobile/enterprise timeline schemas when they are irrelevant.
-
-## `--tool-profile stego`
-
-Adds/emphasizes:
-
-```text
-stego_statistics
-image_transform
-all frame/palette/raw sample operations
-audio signal/stego
-metadata and structure tools
-```
-
-## `--tool-profile network`
-
-Expose all PCAP + Zeek tools, artifact/file tools, not mobile/memory by default.
-
-## `--tool-profile disk`
-
-Expose TSK/libewf/PhotoRec/bulk/timeline/database/document/browser-related tools.
-
-## `--tool-profile windows`
-
-Requires full image; expose EVTX/registry/MFT/prefetch/LNK/PST + timeline/database/disk.
-
-## `--tool-profile memory`
-
-Requires full image; expose Volatility/MemProcFS + YARA-X/artifact tools.
-
-## `--tool-profile all`
-
-For advanced clients only. Expect materially higher tool-description/schema prompt cost.
+`pdf_render` should not be mandatory in minimal `core` if the selected renderer's license/footprint conflicts with Havk goals; it can be installed as a profile component.
 
 ---
 
-# 21. Tool/backend mapping principles
+# 12. Office and generic document forensics
 
-## 21.1 Never expose backend names as normal tools
+Still within scope because Office/PDF are recurring forensic evidence formats.
 
-Avoid:
+## Core/Main
+
+- `oletools`: VBA/macros/OLE/RTF objects;
+- `msoffcrypto-tool`: Office encryption/decryption when password is available;
+- 7zz/native ZIP view for OOXML container structure;
+- ExifTool for metadata.
+
+## Semantic API
+
+| Tool | Intent |
+|---|---|
+| `office_triage` | format/container, encryption state, metadata, macro presence, embedded object inventory |
+| `office_macros` | list/extract/analyze VBA streams and suspicious constructs |
+| `office_extract` | embedded objects/media/package members to artifacts |
+| `office_decrypt` | known-password decryption to child artifact |
+
+Do not add generic document editing/conversion unrelated to forensics.
+
+---
+
+# 13. Archive, carving and recovery
+
+## Core/Main
+
+- 7zz;
+- Binwalk v3;
+- native Havk signature carver;
+- bkcrack;
+- fcrackzip;
+- pdfcrack where PDF password workflow needs it.
+
+## Full/Main
+
+- unblob;
+- Deark;
+- PhotoRec;
+- bulk_extractor.
+
+## 13.1 bkcrack stays Core/Main
+
+Recent 2025–2026 CTFs repeatedly use known-plaintext ZipCrypto attacks. The important abstraction is not “brute force ZIP password” but:
 
 ```text
-run_exiftool
-run_tshark
-run_volatility
-run_binwalk
+identify ZipCrypto
+→ inspect candidate known plaintext
+→ recover internal keys
+→ decrypt selected/all members
 ```
+
+Examples:
+
+- RITSEC CTF 2026 “Zipped Up”;
+- SK-CERT CyberGame 2026 “Zippy zip”.
+
+## 13.2 Semantic API
+
+| Tool | Intent |
+|---|---|
+| `archive_info` | member list, sizes, methods, encryption, ratio/bomb/path anomalies |
+| `archive_extract` | selected/all bounded extraction |
+| `archive_repair` | ZIP structure diagnosis/repair candidate |
+| `archive_crypto` | scheme detect, dictionary mode, ZipCrypto known-plaintext, decrypt |
+| `carve_scan` | signatures/embedded structures with offsets |
+| `carve_extract` | selected candidates / bounded recursion |
+| `raw_recover` | full-profile PhotoRec-style recovery task |
+| `forensic_features` | full-profile bulk_extractor features/histograms |
+
+---
+
+# 14. Disk/filesystem forensics
+
+## Core/Main
+
+### The Sleuth Kit
+
+Repository: https://github.com/sleuthkit/sleuthkit
+
+Semantic roles:
+
+- partitions/volumes;
+- filesystem info;
+- files/directories;
+- deleted entries;
+- inode/metadata;
+- file extraction.
+
+### libewf / ewf-tools
+
+Use current upstream source build for E01/Ex01 rather than relying on an ancient distro package. Normal Havk workflows should use one-shot read/export APIs/tools; do not require FUSE `ewfmount`.
+
+### 7zz fast path
+
+Use 7zz when it can list/extract a disk/container without root or mount. TSK remains the forensic-aware path.
+
+## Full/Main
+
+- PhotoRec for metadata-independent signature recovery;
+- Plaso/log2timeline for timelines;
+- bulk_extractor;
+- qemu-img for virtual disk conversion/info when necessary.
+
+## Semantic API
+
+| Tool | Intent |
+|---|---|
+| `disk_info` | disk/container/EWF metadata, geometry/image properties |
+| `disk_partitions` | partition/volume layout |
+| `fs_info` | filesystem parameters |
+| `fs_list` | directory/deleted entry listing with paging |
+| `fs_stat` | inode/file metadata |
+| `fs_extract` | path/inode extraction to artifact |
+| `fs_recover` | PhotoRec/full raw recovery |
+| `timeline_build` | Plaso targeted/super timeline |
+
+TestDisk partition-write/repair functionality remains excluded from the normal read-only MCP surface.
+
+---
+
+# 15. Memory forensics
+
+## Volatility 3 — Full/Main
+
+Repository: https://github.com/volatilityfoundation/volatility3
+
+Do not expose arbitrary plugin names as a public free-form field by default. Havk should map stable semantic operations to vetted plugin sets.
+
+## MemProcFS — Full/Experimental/optional
+
+Repository: https://github.com/ufrisk/MemProcFS
+
+Worth evaluating because it offers batch forensic mode, Linux builds, Rust APIs and useful process/network/registry/file/timeline capabilities. Keep experimental because:
+
+- AGPL distribution implications;
+- mount/VFS-oriented lifecycle for many workflows;
+- overlap with Volatility + Windows artifact stack;
+- Havk needs one-shot worker behavior rather than long-lived mount dependence.
+
+## Semantic API
+
+| Tool | Intent |
+|---|---|
+| `memory_info` | layer/OS/kernel/symbol diagnostics |
+| `memory_processes` | process tree/list/cmdline summary |
+| `memory_network` | sockets/connections |
+| `memory_modules` | DLLs/modules/drivers/malfind-oriented summaries |
+| `memory_files` | file-object inventory/scan |
+| `memory_scan` | YARA-X / targeted memory scan |
+| `memory_dump` | selected process/module/file dump to artifact |
+
+All memory operations are Tasks above trivial thresholds.
+
+---
+
+# 16. Windows artifact forensics
+
+Keep only artifacts that directly support digital forensics; do not expand into full enterprise IR orchestration in this document.
+
+## Main
+
+- Rust `evtx` parser in isolated worker;
+- `regipy` and/or proven registry parsers;
+- libyal family where useful: `liblnk`, `libscca`, `libpff`;
+- TSK for NTFS context.
+
+## Experimental replacements
+
+- Rust `mft` parser;
+- ForensicRS components after differential testing.
+
+## Optional hunt bundle
+
+- Hayabusa: https://github.com/Yamato-Security/hayabusa
+- Chainsaw: https://github.com/WithSecureOpenSource/chainsaw
+
+Both are useful for event-log hunting/timeline workflows but have copyleft licensing considerations and overlap. Do not expose separate `hayabusa_run` and `chainsaw_run`; provide one semantic `win_hunt` capability and select the configured backend.
+
+## Semantic API
+
+| Tool | Intent |
+|---|---|
+| `win_evtx` | query/summary/export events |
+| `win_hunt` | Sigma/rules/timeline hunt |
+| `win_registry` | hive/keys/values/timestamps and common artifact paths |
+| `win_mft` | MFT records/paths/times/resident data/anomalies |
+| `win_prefetch` | application execution metadata |
+| `win_lnk` | target, volume, path, timestamps, network info |
+| `win_pst` | message/folder/attachment extraction |
+
+---
+
+# 17. SQLite forensic analysis
+
+SQLite appears in browser/app/mobile/Windows artifacts even when we are not yet building those entire domains, so direct database forensics belongs here.
+
+## Core/Main
+
+`rusqlite` read-only/immutable path:
+
+- schema;
+- table/view/index inventory;
+- bounded rows;
+- BLOB inventory/extraction;
+- sidecar (`-wal`, `-shm`, journal) inventory;
+- timestamp/text heuristics.
+
+## Full/Experimental
+
+Evaluate `sqlite-forensic` / sqlite4n6:
+
+- https://github.com/SecurityRonin/sqlite-forensic
+
+Reason: focused read-only recovery from WAL/journal/freelist/deleted regions with corpus-oriented validation. Too new for Main.
+
+## Semantic API
+
+```text
+database_info
+database_query
+database_extract
+database_recover   # full/experimental
+```
+
+---
+
+# 18. Master semantic MCP API
+
+The full catalog is intentionally richer than 21 mega-tools. Profiles keep prompt/schema cost manageable.
+
+## 18.1 Control and artifacts
+
+1. `doctor`
+2. `artifact_query`
+3. `artifact_read`
+4. `artifact_export`
+5. `job`
+
+## 18.2 Generic forensic file tools
+
+6. `file_identify`
+7. `file_hash`
+8. `file_strings`
+9. `file_hex`
+10. `file_entropy`
+11. `file_scan`
+12. `file_structure`
+13. `file_repair`
+14. `metadata_read`
+15. `metadata_extract`
+
+## 18.3 Archive/carving
+
+16. `archive_info`
+17. `archive_extract`
+18. `archive_repair`
+19. `archive_crypto`
+20. `carve_scan`
+21. `carve_extract`
+22. `raw_recover` *(full)*
+23. `forensic_features` *(full)*
+
+## 18.4 Steganography
+
+24. `stego_triage`
+25. `stego_lsb_scan`
+26. `stego_lsb_extract`
+27. `stego_planes`
+28. `stego_palette`
+29. `stego_frames`
+30. `stego_text`
+31. `stego_jpeg`
+32. `stego_statistics`
+33. `image_compare`
+34. `image_ocr`
+35. `image_barcode`
+36. `media_probe`
+37. `media_extract`
+38. `audio_spectrogram`
+39. `audio_signal_decode`
+40. `audio_stego`
+
+## 18.5 PDF/Office
+
+41. `pdf_triage`
+42. `pdf_objects`
+43. `pdf_search`
+44. `pdf_extract`
+45. `pdf_render`
+46. `pdf_repair`
+47. `pdf_decrypt`
+48. `pdf_audit`
+49. `office_triage`
+50. `office_macros`
+51. `office_extract`
+52. `office_decrypt`
+
+## 18.6 Network/PCAP
+
+53. `pcap_info`
+54. `pcap_validate`
+55. `pcap_repair`
+56. `pcap_transform`
+57. `pcap_secrets`
+58. `pcap_merge`
+59. `pcap_reorder`
+60. `pcap_from_text`
+61. `pcap_packets`
+62. `pcap_packet`
+63. `pcap_filter`
+64. `pcap_fields`
+65. `pcap_search`
+66. `pcap_follow`
+67. `pcap_export`
+68. `pcap_stats`
+69. `pcap_protocol`
+70. `pcap_ctf_decode`
+71. `network_logs` *(full)*
+72. `pcap_capture` *(explicit live mode only)*
+
+## 18.7 Disk/filesystem
+
+73. `disk_info`
+74. `disk_partitions`
+75. `fs_info`
+76. `fs_list`
+77. `fs_stat`
+78. `fs_extract`
+79. `fs_recover` *(full)*
+80. `timeline_build` *(full)*
+
+## 18.8 Memory
+
+81. `memory_info` *(full)*
+82. `memory_processes` *(full)*
+83. `memory_network` *(full)*
+84. `memory_modules` *(full)*
+85. `memory_files` *(full)*
+86. `memory_scan` *(full)*
+87. `memory_dump` *(full)*
+
+## 18.9 Windows artifacts
+
+88. `win_evtx` *(full)*
+89. `win_hunt` *(full/optional hunt bundle)*
+90. `win_registry` *(full)*
+91. `win_mft` *(full)*
+92. `win_prefetch` *(full)*
+93. `win_lnk` *(full)*
+94. `win_pst` *(full)*
+
+## 18.10 Database
+
+95. `database_info`
+96. `database_query`
+97. `database_extract`
+98. `database_recover` *(full/experimental)*
+
+The `all` profile therefore approaches ~100 semantic tools, but **normal clients should not receive the `all` profile**. That is the lesson from HexStrike's 150+ tool-count problem.
+
+---
+
+# 19. Recommended MCP tool profiles
+
+## 19.1 `forensics`
+
+A practical default forensic profile should expose roughly 45–60 tools, not all 98.
+
+Include:
+
+```text
+control/artifact
+file + metadata
+archive + carving
+PDF/Office
+database core
+PCAP offline core
+disk core
+```
+
+Exclude by default:
+
+```text
+live capture
+memory
+Windows specialized parsers
+stego statistics/ML
+Zeek/timeline/raw recovery heavy paths
+```
+
+## 19.2 `stego`
 
 Expose:
 
 ```text
-metadata_read
-pcap_follow
-memory_processes
-carve_scan
+control/artifact
+file structure/metadata
+carve/archive core
+all stego/image/audio tools
+PDF extraction/render (because PDFs often contain hidden images/fonts/streams)
+small subset of PCAP covert-channel tools if network steg is desired
 ```
 
-Backend names may appear only as optional `backend_preference` in expert/diagnostic mode and in result provenance.
+## 19.3 `network`
 
-## 21.2 Independent validators are valuable
+Expose all 20 network tools plus:
 
-Some intentional overlap is good when parsers are handling malformed adversarial data:
+```text
+artifact/file/hash/strings/entropy
+carve_scan/carve_extract
+archive_info/archive_extract
+YARA-X scan
+```
 
-- qpdf + pdfcpu;
-- deterministic magic + Magika;
-- native LSB + zsteg oracle during migration;
-- EVTX direct parser + Hayabusa/Chainsaw high-level hunting;
-- TSK + 7zz view of disk containers;
-- Binwalk + unblob fallback.
+This allows recovered HTTP/SMB/TFTP objects to flow directly into forensic analysis without a second MCP server.
 
-The semantic layer should report disagreement instead of silently selecting whichever returned first.
+## 19.4 `all`
+
+For dedicated forensic clients/evaluation only. Tool-schema cost must be measured and documented.
 
 ---
 
-# 22. Promotion policy for Experimental backends
+# 20. Main / Experimental backend matrix
 
-A rewrite can replace a Main backend only after it passes all gates relevant to its domain.
-
-Example:
+## 20.1 Core/Main
 
 ```text
-OxiDex candidate
-  ↓
-metadata corpus (camera/office/pdf/media/malformed)
-  ↓
-compare tag presence/value/type with ExifTool
-  ↓
-crash/OOM corpus
-  ↓
-performance/footprint
-  ↓
-real CTF corpus
-  ↓
-promotion PR
+Havk native primitives
+YARA-X
+Magika
+ExifTool
+Binwalk v3
+7zz
+zsteg (transitional)
+StegSeek
+steghide
+OutGuess
+jsteg
+zxing-cpp
+Tesseract
+FFmpeg/ffprobe
+qpdf
+pdfcpu
+pdfid.py / pdf-parser.py
+oletools
+msoffcrypto-tool
+bkcrack
+fcrackzip
+pdfcrack
+Wireshark CLI suite:
+  tshark
+  capinfos
+  captype
+  editcap
+  mergecap
+  reordercap
+  text2pcap
+  dumpcap (disabled runtime capability)
+pcapfix
+The Sleuth Kit
+libewf
+rusqlite
 ```
 
-Suggested gates:
-
-- no source-evidence mutation;
-- zero uncontrolled panics in hostile corpus;
-- bounded memory/output under policy;
-- architecture support x86_64 + aarch64;
-- minimum agreed coverage/parity threshold;
-- documented known divergences;
-- deterministic output for same input/version;
-- license acceptable for selected distribution bundle.
-
----
-
-# 23. Golden corpus design
-
-Test **capabilities**, not exact backend stdout.
+## 20.2 Core/Experimental
 
 ```text
-tests/corpus/
-├── file/
-│   ├── extension-mismatch/
-│   ├── appended-data/
-│   ├── polyglot/
-│   └── damaged-headers/
-├── stego/
-│   ├── png-lsb/
-│   ├── png-palette/
-│   ├── gif-local-palette/
-│   ├── apng-frames/
-│   ├── jpeg-steghide/
-│   ├── jpeg-outguess/
-│   ├── jpeg-jsteg/
-│   ├── text-zero-width/
-│   └── audio/
-├── archive/
-│   ├── zipcrypto-known-plaintext/
-│   ├── encrypted/
-│   ├── truncated/
-│   └── bombs-policy-only/
-├── document/
-│   ├── suspicious-pdf/
-│   ├── malformed-pdf/
-│   ├── macro-office/
-│   └── encrypted-office/
-├── pcap/
-│   ├── http-object/
-│   ├── dns-exfil/
-│   ├── usb-hid/
-│   ├── smb-object/
-│   └── malformed/
-├── disk/
-│   ├── ext4-deleted/
-│   ├── ntfs-deleted/
-│   ├── e01/
-│   └── photorec-carving/
-├── sqlite/
-│   ├── wal/
-│   ├── journal/
-│   ├── freelist/
-│   └── deleted-records/
-├── windows/
-│   ├── evtx/
-│   ├── mft/
-│   ├── registry/
-│   ├── prefetch/
-│   └── lnk/
-└── memory/
-    └── small-published-samples/
-```
-
-Differential oracles may include legacy tools even when they are not shipped at runtime.
-
-Examples:
-
-- pngcheck as PNG validation oracle;
-- zsteg as LSB oracle;
-- StegExpose as classical steganalysis oracle;
-- ExifTool vs OxiDex;
-- ZXing-C++ vs rxing;
-- Tesseract vs ocrs;
-- qpdf/pdfcpu/lopdf cross-parser;
-- sqlite4n6 vs sqlite-dissect/FQLite/undark on public forensic corpora.
-
----
-
-# 24. CTF evidence that directly influenced this design
-
-This is not an attempt to count tool popularity mechanically. It is evidence that certain capabilities still occur in modern challenges.
-
-| Capability | Recent evidence | Design consequence |
-|---|---|---|
-| PNG LSB | CTF@CIT 2025, Hacktheon Sejong 2025 use zsteg extraction | keep exact LSB search/extract semantics |
-| zsteg false positives | 2026 write-up documents large noisy `-a` output | rank evidence; never treat signature coincidence as truth |
-| GIF local palettes | SAS CTF 2025 uses local palette/index trick | raw GIF palette/index parser is core |
-| APNG structure | openECSC 2025 Calamansi | APNG frame/chunk semantics are core |
-| JPEG OutGuess | SCTF 2026 challenge solved by OutGuess after other methods failed | OutGuess belongs in runtime coverage |
-| ZIP known plaintext | TJCTF 2025, Pengcheng Cup 2025, RITSEC 2026 | `archive_crypto` must model known-plaintext, not only passwords |
-| USB HID PCAP | ApoorvCTF 2025, Null CTF 2025 | native HID reconstruction on tshark fields |
-| Audio spectrogram | multiple 2025 challenge write-ups | spectrogram generation remains core |
-| Memory | 2025–2026 CTF workflows still use Volatility | Volatility remains full/main |
-
-Selected write-ups:
-
-- https://github.com/Diephho/CTF-CIT-2025-Writeups
-- https://cofastic.com/writeups/hacktheon-sejong-2025-ctf-writeup
-- https://ctftime.org/writeup/40254
-- https://ctf.zeba.dev/2025/openecsc/stego/calamansi/writeup/
-- https://github.com/hax1ng/SCTF-2026-writeups/blob/main/misc/SYC4113/README.md
-- https://ctf.gg/blog/tjctf-2025/misc
-- https://medium.com/@wireshark.pcap/ritsec-ctf-2026-zipped-up-writeup-by-wireshark-pcap-b2979b696bae
-- https://astro.bili33.top/posts/CTF-PCB2025-Preliminary-Round-Writeup/
-- https://ahmed-naser.medium.com/apoorvctf-2025-forensics-challenges-33c2d128e9f1
-- https://banua.medium.com/null-ctf-2025-writeup-1aa4f13e5709
-
----
-
-# 25. Main / Experimental / optional decision matrix
-
-## Core/Main — recommended default
-
-```text
-Havk native:
-  magic/hash/strings/entropy/byte windows
-  appended/polyglot
-  PNG/APNG/GIF/JPEG structural parsers
-  simple repair
-  raw carver
-  palette/bitplane/image diff
-  text stego
-  audio primitives
-  USB HID/DNS/ICMP CTF decoders
-
-Backends:
-  YARA-X
-  Magika CLI
-  Binwalk v3
-  ExifTool
-  7zz
-  zxing-cpp
-  Tesseract
-  zsteg (temporary oracle/runtime fallback)
-  StegSeek
-  steghide
-  OutGuess
-  jsteg
-  gifsicle
-  FFmpeg/ffprobe
-  qpdf
-  pdfcpu
-  Poppler
-  pdfid/pdf-parser (compatibility path)
-  oletools
-  msoffcrypto-tool
-  mail-parser (Rust)
-  bkcrack
-  fcrackzip
-  pdfcrack
-  tshark/capinfos/editcap
-  pcapfix
-  The Sleuth Kit
-  libewf/ewf-tools
-  rusqlite
-```
-
-## Core/Experimental
-
-```text
-native full LSB parity engine
+Havk native generalized LSB scanner (until parity)
 chi-square / RS / SPA
+sharkd internal backend
 OxiDex
 rxing
 ocrs
 lopdf
-archive-forensic
 ```
 
-## Full/Main
+## 20.3 Full/Main
 
 ```text
 unblob
 Deark
-ImageMagick fallback
-libwebp tools
-multimon-ng
-minimodem
 PhotoRec
 bulk_extractor
 Plaso
 Zeek
 qemu-img
 Volatility 3
-EVTX Rust parser
 regipy
-libyal: liblnk/libscca/libpff (+ relevant family libs)
-Hindsight
-iLEAPP
-ALEAPP
+libyal LNK/Prefetch/PST family
+ImageMagick fallback
+multimon-ng
+minimodem
 OpenStego
 ```
 
-Copyleft optional full bundle (depending distribution policy):
+## 20.4 Full/Experimental / optional
 
 ```text
-Hayabusa (AGPLv3)
-Chainsaw (GPLv3)
-```
-
-## Full/Experimental
-
-```text
-MemProcFS (strong tool, but AGPL + lifecycle/overlap integration needs validation)
-mft Rust
+Rust mft parser
 ForensicRS
 sqlite-forensic/sqlite4n6
-SSTV Python decoder
+MemProcFS
+SSTV decoder
+Hayabusa/Chainsaw optional copyleft hunt bundle
+mutool optional AGPL PDF backend
 ```
 
-## Separate optional image
+## 20.5 Separate optional
 
 ```text
 stego-ml:
@@ -1524,170 +1453,335 @@ stego-ml:
 
 ---
 
-# 26. Tools deliberately rejected or not default
+# 21. Backends deliberately not default
 
 | Tool | Decision | Reason |
 |---|---|---|
-| YARA classic | replaced for new project | YARA-X official successor path |
-| Binwalk v2 | reject | v3 upstream rewrite |
-| Foremost | reject default | native carver + PhotoRec/unblob cover stronger roles |
-| Scalpel | reject default | same overlap; no need to ship another raw carver |
-| StegSolve | reject runtime | GUI; implement semantic bitplane/frame/diff operations |
-| stegcracker | reject | StegSeek |
-| stegsnow | reject runtime | native text/whitespace parser |
-| pngcheck | DEV oracle | native parser in runtime |
-| ZBar | reject default | ZXing-C++ broader/current; rxing experimental |
-| SoX | reject core | FFmpeg + native DSP; avoid redundant runtime |
-| Aletheia | not default | useful but heavy; `stego-ml` image |
-| Suricata | optional | strong but overlap with Zeek/tshark for CTF scope |
-| NetworkMiner | reject default | GUI/.NET workflow less MCP-friendly |
-| TestDisk | no default public tool | scriptable but potentially destructive partition operations |
-| ewfmount/xmount | reject normal flow | long-lived mount state/FUSE unnecessary |
-| `dissect.target` | not bundled default | AGPL + overlap; possible external integration |
-| general John/hashcat | different Havk crypto/password module | avoid turning forensic MCP into universal cracker |
+| YARA classic | replace for new Havk rules | YARA-X successor path |
+| Binwalk v2 | reject | v3 upstream Rust rewrite |
+| Foremost | not default | native carver + PhotoRec/unblob cover better-defined roles |
+| Scalpel | not default | same overlap |
+| StegSolve | no runtime dependency | GUI functions become typed bit-plane/palette/frame tools |
+| StegCracker | reject | StegSeek |
+| stegsnow | no runtime dependency | native whitespace/unicode steg |
+| pngcheck | DEV oracle | native PNG parser/repair |
+| ZBar | reject default | zxing-cpp main, rxing experimental |
+| SoX | no core requirement | FFmpeg + native DSP cover the selected scope |
+| Suricata | optional only | IDS/rules ecosystem overlaps Zeek/tshark for CTF forensic scope |
+| tcpflow | reject default | stream reconstruction already available |
+| Arkime | reject current scope | heavy server/indexing platform |
+| TestDisk write/repair operations | reject normal public API | destructive partition operations conflict with evidence immutability |
+| ewfmount/xmount | reject normal path | long-lived mount state/FUSE unnecessary |
+| arbitrary `vol.py <plugin>` | reject public API | semantic allowlisted memory operations only |
+| generic shell / `additional_args` | reject | injection risk and unstable contract |
 
 ---
 
-# 27. Open research / first implementation spikes
+# 22. Doctor and capability probing
 
-Before PRD is declared implementation-ready, run these spikes:
+`doctor` should verify behavior, not just executable presence.
 
-1. **rmcp 3.4.x prototype**
-   - stdio + Streamable HTTP;
-   - structuredContent + outputSchema;
-   - Artifact ResourceLink;
-   - MCP Tasks + fallback job;
-   - stateless HTTP workspace state.
+Example capability probes:
 
-2. **Worker isolation prototype**
-   - Rust parser panic isolation;
-   - process groups/cancellation;
-   - rlimit/cgroup/seccomp strategy;
-   - extract-size and recursion policies.
-
-3. **Raw image representation**
-   - PNG sub-8-bit and 16-bit fixtures;
-   - indexed PNG;
-   - GIF local palette;
-   - APNG;
-   - ensure no automatic RGB conversion before raw-steg analysis.
-
-4. **JPEG steg compatibility corpus**
-   - steghide/StegSeek;
-   - OutGuess;
-   - jsteg;
-   - exact positive/negative fixtures.
-
-5. **PDF parser differential corpus**
-   - qpdf vs pdfcpu vs Didier scripts vs lopdf;
-   - malformed object streams/xrefs;
-   - JavaScript/actions/attachments.
-
-6. **E01/Ex01**
-   - build current libewf;
-   - test E01 + Ex01 published fixtures;
-   - one-shot export/read path without FUSE.
-
-7. **SQLite forensic recovery**
-   - public Nemetz/DFRWS/DC3 corpora;
-   - sqlite4n6 vs sqlite-dissect/FQLite/SQLite recover;
-   - precision/recall and false-positive reporting.
-
-8. **Memory backend comparison**
-   - Volatility 3 default;
-   - MemProcFS batch mode as experimental alternate;
-   - compare process/network/file recovery on small published images.
-
-9. **Tool-surface prompt measurement**
-   - measure serialized `tools/list` bytes/tokens for `ctf`, `stego`, `network`, `disk`, `all`;
-   - target a default tool-profile budget rather than arbitrary tool count.
-
-10. **Docker footprint measurement**
-    - x86_64 + arm64;
-    - core/full/stego-ml;
-    - largest layers/dependencies documented.
-
----
-
-# 28. Recommended next document
-
-The next artifact should no longer be a broad tool search. It should be the implementation matrix:
+## Wireshark suite
 
 ```text
-semantic tool
-→ input schema
-→ output schema
-→ main backend
-→ experimental backend
-→ resource limits
-→ sync/task threshold
-→ artifact types
-→ annotations
-→ golden tests
-→ acquisition/lock entry
+versions all match expected lock
+capinfos parses fixture
+tshark JSON/fields fixture
+editcap transforms without mutation
+mergecap combines two fixture captures
+reordercap corrects known disorder
+text2pcap round-trips known hex fixture
+dumpcap binary exists but reports live capability disabled unless server mode allows it
+sharkd experimental JSON-RPC handshake if installed
 ```
 
-Then convert that matrix into the PRD and Rust crate/module boundaries.
+## PDF
+
+```text
+qpdf JSON parses fixture
+qpdf validator handles malformed fixture within limits
+pdfcpu strict + relaxed validation fixture
+pdfid suspicious-key fixture
+pdf-parser selected-object fixture
+mutool optional backend only if profile/license-enabled
+```
+
+## Stego
+
+```text
+zsteg known PNG fixture
+StegSeek known steghide fixture
+OutGuess known JPEG fixture
+JSteg known JPEG fixture
+native LSB parity fixture
+GIF local palette fixture
+APNG frame fixture
+```
 
 ---
 
-# 29. Primary references
+# 23. Golden corpus
+
+Tests should assert forensic capability, not exact stdout.
+
+```text
+tests/corpus/
+├── file/
+│   ├── extension-mismatch/
+│   ├── appended/
+│   ├── polyglot/
+│   └── damaged/
+├── stego/
+│   ├── png-lsb/
+│   ├── png-palette/
+│   ├── gif-local-palette/
+│   ├── apng/
+│   ├── jpeg-steghide/
+│   ├── jpeg-outguess/
+│   ├── jpeg-jsteg/
+│   ├── text/
+│   └── audio/
+├── archive/
+│   ├── zipcrypto-known-plaintext/
+│   ├── encrypted/
+│   └── truncated/
+├── pdf/
+│   ├── object-stream/
+│   ├── embedded-file/
+│   ├── javascript-openaction/
+│   ├── hidden-image/
+│   ├── custom-font/
+│   ├── xref-damaged/
+│   └── encrypted/
+├── pcap/
+│   ├── metadata/
+│   ├── out-of-order/
+│   ├── damaged-pcap/
+│   ├── damaged-pcapng/
+│   ├── merge/
+│   ├── text2pcap/
+│   ├── http-export/
+│   ├── smb-export/
+│   ├── usb-hid/
+│   ├── dns-exfil/
+│   └── icmp-covert/
+├── disk/
+│   ├── ext4-deleted/
+│   ├── ntfs-deleted/
+│   ├── e01/
+│   └── raw-recovery/
+├── memory/
+│   └── small-published-images/
+├── windows/
+│   ├── evtx/
+│   ├── registry/
+│   ├── mft/
+│   ├── prefetch/
+│   └── lnk/
+└── sqlite/
+    ├── wal/
+    ├── journal/
+    └── deleted/
+```
+
+## 23.1 Differential tests
+
+Use older/external tools as oracles even when they are not shipped:
+
+```text
+native LSB ↔ zsteg
+native PNG parser ↔ pngcheck
+OxiDex ↔ ExifTool
+rxing ↔ zxing-cpp
+ocrs ↔ Tesseract
+lopdf ↔ qpdf/pdfcpu/mutool
+sqlite4n6 ↔ sqlite-dissect / known-ground-truth corpus
+sharkd ↔ tshark result equivalence
+```
+
+---
+
+# 24. Recommended first implementation order
+
+## Phase A — MCP and artifact foundation
+
+1. `rmcp` 3.x server for stdio + Streamable HTTP;
+2. artifact registry;
+3. immutable child-artifact writes;
+4. worker execution budgets;
+5. Tasks + `job` fallback;
+6. tools.lock + doctor framework.
+
+## Phase B — high-value Core/Main
+
+1. generic file primitives;
+2. ExifTool/YARA-X/Magika;
+3. 7zz/Binwalk;
+4. raw PNG/GIF/APNG/JPEG parsers;
+5. zsteg/StegSeek/OutGuess/jsteg;
+6. qpdf/pdfcpu/Didier PDF layer;
+7. complete Wireshark CLI suite semantics;
+8. TSK/libewf.
+
+## Phase C — CTF-native logic
+
+1. native LSB parity;
+2. USB HID;
+3. DNS/ICMP covert reconstruction;
+4. audio spectrogram/DTMF/PCM LSB;
+5. native repair primitives;
+6. archive known-plaintext workflow.
+
+## Phase D — Full
+
+1. Volatility 3;
+2. Zeek;
+3. PhotoRec/bulk_extractor/Plaso;
+4. Windows artifacts;
+5. unblob/Deark;
+6. experimental sharkd;
+7. optional mutool/AGPL profile if licensing decision permits it.
+
+---
+
+# 25. Key research conclusions
+
+## Network
+
+The important correction is that **TShark is the dissector, not the whole forensic toolchain**. Capinfos, editcap, mergecap, reordercap, text2pcap, dumpcap and potentially sharkd deserve explicit backend roles because they solve different forensic transformations and acquisition problems.
+
+## PDF
+
+The important correction is the opposite of Gemini's “mutool only” simplification: **mutool deserves first-class support, but parser/tool diversity is valuable and MuPDF's AGPL/commercial license matters for a Docker-distributed MCP**. qpdf + pdfcpu should remain the machine-structured permissive default; Didier scripts remain useful security specialists; mutool is an excellent optional independent engine.
+
+## Steganography
+
+The important correction is to keep raw representation as evidence. PNG/GIF/APNG/JPEG structures, palette indices, bit depths and frame structures cannot be safely reduced to a generic RGB image before analysis.
+
+## MCP design
+
+The important correction from HexStrike is that breadth should live **behind profiles and semantic contracts**, not in a 150-tool flat list and not behind `additional_args` strings.
+
+---
+
+# 26. Primary references
 
 ## MCP / Rust
 
-- Official Rust SDK: https://github.com/modelcontextprotocol/rust-sdk
-- rmcp releases: https://github.com/modelcontextprotocol/rust-sdk/releases
-- rmcp roadmap/conformance: https://github.com/modelcontextprotocol/rust-sdk/blob/main/ROADMAP.md
-- rmcp 3.x migration: https://github.com/modelcontextprotocol/rust-sdk/discussions/969
-- MCP 2026-07-28 announcement/spec context: https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/blog/content/posts/2026-07-28-spec-ga/index.md
-- Tasks extension: https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks
+- MCP specification: https://modelcontextprotocol.io/
+- MCP source/spec repository: https://github.com/modelcontextprotocol/modelcontextprotocol
+- Official Rust SDK (`rmcp`): https://github.com/modelcontextprotocol/rust-sdk
+- rmcp migration guide: https://github.com/modelcontextprotocol/rust-sdk/discussions/969
+- rmcp roadmap: https://github.com/modelcontextprotocol/rust-sdk/blob/main/ROADMAP.md
 
-## Core forensic/steg backends
+## MCP implementations reviewed
+
+- HexStrike-AI: https://github.com/0x4m4/hexstrike-ai
+- Wireshark-MCP: https://github.com/bx33661/Wireshark-MCP
+- ctf-buster: https://github.com/agentfanclub/ctf-buster
+- CTF-MCP: https://github.com/Coff0xc/CTF-MCP
+- ctfd-mcp-server: https://github.com/MrJamescot/ctfd-mcp-server
+- steganography-mcp: https://github.com/badchars/steganography-mcp
+- Mulder: https://github.com/calebevans/mulder
+- SIFT-MCP / Valhuntir: https://github.com/AppliedIR/sift-mcp
+- volatility-mcp: https://github.com/Gaffx/volatility-mcp
+
+## Network
+
+- Wireshark: https://www.wireshark.org/
+- Wireshark command-line docs: https://www.wireshark.org/docs/wsug_html_chunked/
+- tshark: https://www.wireshark.org/docs/man-pages/tshark.html
+- capinfos: https://www.wireshark.org/docs/man-pages/capinfos.html
+- editcap: https://www.wireshark.org/docs/man-pages/editcap.html
+- mergecap: https://www.wireshark.org/docs/man-pages/mergecap.html
+- reordercap: https://www.wireshark.org/docs/man-pages/reordercap.html
+- text2pcap: https://www.wireshark.org/docs/man-pages/text2pcap.html
+- dumpcap: https://www.wireshark.org/docs/man-pages/dumpcap.html
+- sharkd: https://www.wireshark.org/docs/man-pages/sharkd.html
+- pcapfix: https://github.com/Rup0rt/pcapfix
+- Zeek: https://github.com/zeek/zeek
+
+## PDF/document
+
+- MuPDF / mutool docs: https://mupdf.readthedocs.io/en/latest/tools/mutool.html
+- MuPDF licensing/releases: https://mupdf.com/releases
+- qpdf: https://github.com/qpdf/qpdf
+- qpdf JSON docs: https://qpdf.readthedocs.io/en/latest/json.html
+- pdfcpu: https://github.com/pdfcpu/pdfcpu
+- Didier Stevens Suite: https://github.com/DidierStevens/DidierStevensSuite
+- oletools: https://github.com/decalage2/oletools
+- msoffcrypto-tool: https://github.com/nolze/msoffcrypto-tool
+
+## Steganography
+
+- zsteg: https://github.com/zed-0xff/zsteg
+- StegSeek: https://github.com/RickdeJager/stegseek
+- steghide: https://github.com/StegHigh/steghide
+- OutGuess maintained source: https://github.com/resurrecting-open-source-projects/outguess
+- JSteg: https://github.com/lukechampine/jsteg
+- OpenStego: https://github.com/syvaidya/openstego
+- Aletheia: https://github.com/daniellerch/aletheia
+
+## Forensic foundation
 
 - YARA-X: https://github.com/VirusTotal/yara-x
 - Magika: https://github.com/google/magika
 - Binwalk: https://github.com/ReFirmLabs/binwalk
 - ExifTool: https://github.com/exiftool/exiftool
-- Deark: https://github.com/jsummers/deark
-- qpdf: https://github.com/qpdf/qpdf
-- pdfcpu: https://github.com/pdfcpu/pdfcpu
-- bkcrack: https://github.com/kimci86/bkcrack
+- 7-Zip: https://www.7-zip.org/
 - unblob: https://github.com/onekey-sec/unblob
-- Volatility 3: https://github.com/volatilityfoundation/volatility3
-- Sleuth Kit: https://github.com/sleuthkit/sleuthkit
+- Deark: https://github.com/jsummers/deark
+- The Sleuth Kit: https://github.com/sleuthkit/sleuthkit
+- TestDisk/PhotoRec: https://www.cgsecurity.org/wiki/TestDisk_Download
 - bulk_extractor: https://github.com/simsong/bulk_extractor
 - Plaso: https://github.com/log2timeline/plaso
-- Zeek: https://github.com/zeek/zeek
+- Volatility 3: https://github.com/volatilityfoundation/volatility3
 - MemProcFS: https://github.com/ufrisk/MemProcFS
-- Hayabusa: https://github.com/Yamato-Security/hayabusa
-- Chainsaw: https://github.com/WithSecureOpenSource/chainsaw
-- iLEAPP: https://github.com/abrignoni/iLEAPP
-- ALEAPP: https://github.com/abrignoni/ALEAPP
+- bkcrack: https://github.com/kimci86/bkcrack
 - sqlite-forensic: https://github.com/SecurityRonin/sqlite-forensic
 
-## Research / modern evidence
+## Selected CTF evidence
 
-- SQLite deleted-record recovery survey (2025): https://www.sciencedirect.com/science/article/pii/S2666281725001714
-- Aletheia JOSS paper/tool: https://joss.theoj.org/papers/10.21105/joss.05982
-- Sample Pair Analysis literature: https://experts.mcmaster.ca/scholarly-works/146164
+- SCTF 2026 OutGuess multi-stage steg: https://github.com/hax1ng/SCTF-2026-writeups/blob/main/misc/SYC4113/README.md
+- IJCTF `reordercap` example: https://ctftime.org/writeup/29374
+- RITSEC 2026 bkcrack: https://medium.com/@wireshark.pcap/ritsec-ctf-2026-zipped-up-writeup-by-wireshark-pcap-b2979b696bae
+- Nullcon 2026 PDF image extraction with mutool: https://www.fu11shoot.com/en/writeups/nullcon-2026/writeuprdctd3/
 
 ---
 
-## Bottom line
+# 27. Final proposed architecture
 
-The correct Havk MCP is **not** a wrapper over 20 classic CTF commands, and it is also **not** 150 backend-specific MCP tools. The target is a typed forensic/steg semantic layer with enough granularity for iterative agent reasoning, backed by a much larger and replaceable backend catalog.
+```text
+                 MCP client
+                     │
+              MCP 2026-07-28
+                     │
+          ┌──────────▼──────────┐
+          │ Havk MCP / rmcp 3.x│
+          │ typed tool profiles│
+          └──────────┬──────────┘
+                     │
+         ┌───────────┼─────────────┐
+         │           │             │
+  Artifact store   Task/job     Policy/router
+  + provenance     registry     + budgets
+         │           │             │
+         └───────────┼─────────────┘
+                     │
+              isolated worker
+                     │
+       ┌─────────────┼──────────────┐
+       │             │              │
+  Native Rust   Rust crates    Upstream CLI
+       │             │              │
+ raw formats      YARA-X       Wireshark suite
+ steg/CTF logic   rusqlite      ExifTool / 7zz
+ decoding                       qpdf/pdfcpu
+                                TSK/libewf
+                                Volatility/etc.
+```
 
-The biggest upgrades over draft v0.2 are:
+The design objective is not the smallest backend count. It is the smallest **stable semantic surface per profile** that still lets an agent investigate evidence iteratively without escaping to arbitrary shell commands.
 
-1. granular PCAP API modeled after the stronger supplied Wireshark-MCP;
-2. raw GIF/APNG/palette/sample steg support;
-3. complete JPEG steg family (StegSeek/steghide + OutGuess + jsteg);
-4. independent PDF validation with pdfcpu;
-5. proper SQLite deleted-record recovery research path;
-6. PhotoRec, bulk_extractor, Plaso, Zeek;
-7. Windows hunt layer (Hayabusa/Chainsaw) with license separation;
-8. browser and mobile forensics (Hindsight, iLEAPP, ALEAPP);
-9. MemProcFS as a serious experimental memory alternative;
-10. MCP-native artifacts/resources/tasks rather than giant stdout responses.
-
-That produces a broader toolset without losing KISS at the public API boundary: the complexity lives behind typed semantic contracts, workers, artifact provenance, and backend capability routing.
